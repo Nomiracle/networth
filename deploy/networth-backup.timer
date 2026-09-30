@@ -1,0 +1,11 @@
+[Unit]
+Description=networth 每日备份定时器（03:00 Asia/Shanghai = 19:00 UTC）
+
+[Timer]
+OnCalendar=*-*-* 19:00:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=networth-backup.service
+
+[Install]
+WantedBy=timers.target

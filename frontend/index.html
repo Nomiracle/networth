@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<!-- networth-app: routes=login,dashboard,snapshot,accounts,account-detail,import,settings mount=#app -->
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#1f2d3d" />
+    <meta name="description" content="净值管家 — 家庭资产负债表与净值追踪" />
+    <title>净值管家</title>
+    <style>
+      /* 挂载前骨架屏：避免任何表单/空白闪现（app 挂载时整块被替换） */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #f5f7fa;
+        font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        color: #1f2d3d;
+      }
+      #app > .boot-splash {
+        box-sizing: border-box;
+        padding: 18px 16px 96px;
+        max-width: 1200px;
+        margin: 0 auto;
+      }
+      .boot-splash .bs-bar {
+        height: 44px;
+        border-radius: 10px;
+        margin-bottom: 14px;
+        background: linear-gradient(90deg, #e9edf2 25%, #f4f6f9 37%, #e9edf2 63%);
+        background-size: 400% 100%;
+        animation: bs-shimmer 1.4s ease-in-out infinite;
+      }
+      .boot-splash .bs-bar.tall {
+        height: 168px;
+      }
+      .boot-splash .bs-bar.grid4 {
+        height: 74px;
+      }
+      .boot-splash .bs-title {
+        font-size: 13px;
+        color: #8a94a6;
+        margin: 0 0 12px;
+      }
+      @keyframes bs-shimmer {
+        0% {
+          background-position: 100% 50%;
+        }
+        100% {
+          background-position: 0 50%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div class="boot-splash" role="status" aria-label="正在启动">
+        <p class="bs-title">净值管家 · 正在校验登录状态…</p>
+        <div class="bs-bar tall"></div>
+        <div class="bs-bar grid4"></div>
+        <div class="bs-bar grid4"></div>
+        <div class="bs-bar"></div>
+        <div class="bs-bar"></div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

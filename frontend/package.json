@@ -1,0 +1,27 @@
+{
+  "name": "networth-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "净值管家 — 家庭净值记账服务前端 (Vue 3 + Vite + TS + Pinia + Element Plus + ECharts)",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json",
+    "build": "vue-tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "1.18.1",
+    "echarts": "5.6.0",
+    "element-plus": "2.14.2",
+    "pinia": "2.3.1",
+    "vue": "3.5.39",
+    "vue-router": "4.6.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "5.2.4",
+    "typescript": "5.6.3",
+    "vite": "5.4.21",
+    "vue-tsc": "2.2.12"
+  }
+}

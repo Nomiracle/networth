@@ -1,0 +1,9 @@
+[Unit]
+Description=networth SQLite 每日备份（保留 7 天）
+Documentation=file://<PROJECT_ROOT>/README.md
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 <PROJECT_ROOT>/deploy/backup.py --db <PROJECT_ROOT>/backend/data/networth.db --dest <BACKUP_DIR> --keep 7
+# 备份走 sqlite3 backup API（WAL 下直接 cp 主库会丢数据）

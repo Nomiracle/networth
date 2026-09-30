@@ -1,0 +1,24 @@
+[Unit]
+Description=networth API (净值管家) - stdlib Python + SQLite
+Documentation=file://<PROJECT_ROOT>/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=<PROJECT_ROOT>/backend
+EnvironmentFile=-<PROJECT_ROOT>/backend/.env
+Environment=NETWORTH_BIND=127.0.0.1
+Environment=NETWORTH_PORT=8972
+Environment=NETWORTH_DB=<PROJECT_ROOT>/backend/data/networth.db
+ExecStart=/usr/bin/python3 -m app.server
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/networth-api.log
+StandardError=append:/var/log/networth-api.log
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
