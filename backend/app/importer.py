@@ -44,10 +44,16 @@ def _load_json(path: Path) -> Any:
 
 
 def _is_liquid(name: str, subclass: str | None) -> int:
-    """现金类资产标记（启发式，仅用于展示口径）。"""
+    """现金类资产标记（启发式，仅用于展示口径）。
+
+    口径：子类的「现金」、账户名里的「活期」，以及通用现金类关键词
+    （现金 / 零钱 / 余额 / 公积金）都视同现金。
+    刻意不写死具体产品名：写死产品名会让口径随账户改名而漂移，
+    也会把使用者的钱包选择写进代码。
+    """
     if "现金" in (subclass or ""):
         return 1
-    if "活期" in name or name in {"现金", "活期存款", "公积金"}:
+    if "活期" in name or any(key in name for key in ("现金", "零钱", "余额", "公积金")):
         return 1
     return 0
 

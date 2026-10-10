@@ -18,10 +18,13 @@ networth/
 │  ├─ app/             #   config / store / domain / importer / fx / api / server
 │  └─ tests/           #   unittest，真跑 HTTP 往返（数据来自 seed_demo）
 ├─ frontend/           # Vue 3 + Vite + TS + Pinia + Element Plus + ECharts
+│  └─ src/mock/        #   dev-only mock（演示数据驱动，生产构建被摇掉）
+├─ mcp/                # 纯标准库 MCP 桥接（只转发到后端 HTTP API）
 ├─ tools/seed_demo.py  # 生成演示数据 + 创建演示账号（唯一的"数据来源"）
 ├─ scripts/xlsx_lite.py# 标准库 xlsx 读取（供自行编写 Excel 导入脚本复用）
 ├─ docs/m1-spec.md     # 接口契约与实施约定
-└─ deploy/             # systemd unit、nginx vhost 模板、备份与发布脚本
+├─ .githooks/pre-commit# 提交前门禁：真实数据永不入库
+└─ deploy/             # systemd unit、nginx vhost 模板、渲染脚本、备份与发布脚本
 ```
 
 ## 功能一览
@@ -63,6 +66,14 @@ networth/
 **登录** —— 单用户登录；首个账号注册后自动关闭注册（需要时用 `ALLOW_REGISTRATION=1` 打开）。
 
 ![登录](docs/screenshots/08-login.webp)
+
+**地点与定位** —— 快照带一等 `location` 字段（城市级文本 + 可选坐标，`source ∈ manual/carried/device/parsed_note`）。
+录入页可一键取当前定位；结转时自动带入最近一期有地点的值，**永不覆盖你手改过的值**；
+没记录的期是「键缺失 + 原因码」，不是空字符串或 0。逆地理由服务端代理（默认关闭）、结果缓存、
+失败返回明确的 4xx/5xx，绝不编造地点。契约见 `docs/m1-spec.md` §8。
+
+**MCP 桥接** —— `mcp/` 是纯标准库实现的 MCP 服务，把工具调用转发给后端 HTTP API
+（后端始终是唯一写者，MCP 进程不碰 SQLite），默认只读、只监听回环。
 
 ## 计算口径
 
@@ -114,24 +125,50 @@ cd backend && /usr/bin/python3 -m unittest discover -s tests -v
 
 测试在运行时用 `tools/seed_demo.py` 生成一份确定性合成数据集（含重复行、正号负债、
 附加表、总览缺记录、用户确认修正等边界），所有断言都相对这份数据集做结构校验，
-不依赖任何固定金额或真实数据。
+不依赖任何固定金额或真实数据。**这是硬要求**：`tests/` 下任何写死金额/日期/账户名、
+或直接读 `data/out/` 的测试都算门禁不通过。
+
+## 提交纪律（真实数据永不入历史）
+
+本仓库的设计前提是「**代码与数据完全分离**」：真实数据只存在于使用者本机
+（`data/source/`、`data/out/`、`backend/data/`、`deploy/local.env`、`deploy/rendered/`），
+这些路径全部在 `.gitignore` 里，仓库里没有 `.json` 数据文件、没有 `.xlsx`、没有 `.db`。
+
+一次习惯性的 `git add -A` 就足以把真实金额、真实账户名与真实地点写进历史，事后只能重写历史补救。
+所以本仓库自带一道本地闸：
+
+```bash
+git config core.hooksPath .githooks   # 每个 clone 各执行一次
+```
+
+`.githooks/pre-commit` 会拒绝：`data/`、`backend/data/`、`deploy/local.env`、`deploy/rendered/`、
+`docs/private/` 等真实数据路径，`*.db`/`*.xlsx`，以及非演示数据来源的
+`frontend/src/mock/fixtures.json`（payload 里的 `"source"` 必须是 `"demo"`）。
+如果你还想拦自己本地的真实金额/账户名/地点关键词，把它们写成一行正则放进
+`.githooks/private-patterns`（该文件已被 gitignore，只在你本机生效），钩子会一并扫描**新增行**。
 
 ## 部署
+
+```bash
+# 0) 机器相关值只写在本机（不入库），然后用它渲染模板
+cp deploy/local.env.example deploy/local.env && "${EDITOR:-vi}" deploy/local.env
+bash deploy/render.sh            # → deploy/rendered/{nginx.conf,*service}（不入库）
+```
 
 ```bash
 # 前端产物 → nginx 静态目录
 WEB_ROOT=/var/www/networth bash deploy/deploy-web.sh
 
-# API → systemd
-sudo cp deploy/networth-api.service /etc/systemd/system/
+# API → systemd（用渲染后的 unit：<PROJECT_ROOT>/<BACKUP_DIR> 已替换）
+sudo cp deploy/rendered/networth-api.service /etc/systemd/system/
 sudo systemctl enable --now networth-api
 
-# vhost（模板含 /api 反代与 SPA 回退；把 <DOMAIN> 等占位符替换掉）
-sudo cp deploy/nginx.conf.template /etc/nginx/conf.d/networth.conf
+# vhost（渲染后的文件已含 /api 反代与 SPA 回退）
+sudo cp deploy/rendered/nginx.conf /etc/nginx/conf.d/networth.conf
 sudo nginx -t && sudo nginx -s reload
 
 # 每日备份（走 sqlite3 backup API，WAL 下安全）
-sudo cp deploy/networth-backup.service deploy/networth-backup.timer /etc/systemd/system/
+sudo cp deploy/rendered/networth-backup.service deploy/networth-backup.timer /etc/systemd/system/
 sudo systemctl enable --now networth-backup.timer
 ```
 
@@ -155,6 +192,14 @@ sudo systemctl enable --now networth-backup.timer
   超出合理区间的返回值一律拒绝。周末/节假日取最近前一交易日并如实返回 `source_date` / `stale_days`。
 - **历史汇率回填**：`cd backend && python3 -m app.fx_backfill`（默认只报告），`--apply`
   只补空缺期，已填写的值不动。
+- **地点与逆地理**：`NETWORTH_GEOCODE_PROVIDER=off`（默认）|`nominatim`|`amap`；关闭时
+  `/api/location/reverse` 返回 409 而不是假装成功。坐标出网前按约 1km 网格粗化后查缓存，
+  失败返回 502 且**不写任何值**。地点写库有专用窄接口
+  （`PUT/POST /api/snapshots/{date}/location`）：**整期写入漏 `items` 会被 400 拒绝**，
+  因为整期 upsert 是「删明细 + 重插」，漏 `items` 会静默清空那一期的明细。
+- **MCP**：`mcp/` 只经 HTTP 调后端，密钥（`NETWORTH_MCP_TOKEN`）只放在
+  `backend/.env`。systemd unit 里**不要**再写一行空的 `Environment=NETWORTH_MCP_TOKEN=`——
+  systemd 后出现的 `Environment=` 会盖掉 `EnvironmentFile`，token 被清空后每次调用都是 401。
 
 ## License
 

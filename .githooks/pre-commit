@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# 提交前门禁：真实数据永不入历史。
+#
+# 为什么需要它：本仓库的设计前提是「代码与数据完全分离」——真实财务数据只存在于使用者本机
+# （data/source、data/out、backend/data、deploy/local.env、deploy/rendered）。
+# 一次习惯性的 `git add -A` 就足以把真实金额、真实账户名与真实地点写进历史，
+# 而事后只能靠重写历史补救（本仓库的历史上就这么补救过一次）。宁可在本地拦住。
+#
+# 启用（每个 clone 各执行一次）：
+#   git config core.hooksPath .githooks
+#
+# 想拦自己本地的真实金额/账户名/地点关键词：把它们写成**一行**扩展正则放进
+# .githooks/private-patterns（该文件已被 gitignore，只在你本机生效）。
+set -uo pipefail
+
+fail=0
+
+# 1) 禁止路径：真实数据、本地部署配置、渲染产物
+bad=$(git diff --cached --name-only --diff-filter=ACM \
+      | grep -E '^(data/|backend/data/|deploy/local\.env$|deploy/rendered/|docs/private/)' || true)
+if [ -n "$bad" ]; then
+  echo "❌ 禁止提交真实数据 / 本地部署配置路径（应保持未提交）："
+  echo "$bad"
+  fail=1
+fi
+
+# 2) 禁止数据库与表格文件：它们必然是真实数据的副本
+bin=$(git diff --cached --name-only --diff-filter=ACM \
+      | grep -Ei '\.(db|db-wal|db-shm|sqlite3?|xlsx|xls)$' || true)
+if [ -n "$bin" ]; then
+  echo "❌ 禁止提交数据库 / 表格文件："
+  echo "$bin"
+  fail=1
+fi
+
+# 3) dev mock 的 fixture 必须是演示数据（payload 里带 "source":"demo"）
+if git diff --cached --name-only --diff-filter=ACM | grep -q '^frontend/src/mock/fixtures\.json$'; then
+  fixture=$(git show :frontend/src/mock/fixtures.json 2>/dev/null || true)
+  case "$fixture" in
+    *'"source":"demo"'*) ;;
+    *)
+      echo '❌ frontend/src/mock/fixtures.json 不是演示数据（缺 "source":"demo"）：'
+      echo '   它必须由 scripts/gen_mock_fixtures.py 从 tools/seed_demo.py 生成后再提交，'
+      echo '   用本地真实解析产物（data/out）生成的版本一律不要提交。'
+      fail=1
+      ;;
+  esac
+fi
+
+# 4) 使用者本地的私有模式（一行扩展正则，不入库）
+patterns_file=".githooks/private-patterns"
+if [ -s "$patterns_file" ]; then
+  # 只扫新增行：修正历史时会删掉含真实数据的旧行，扫全 diff 会误报
+  hits=$(git diff --cached --unified=0 \
+         | grep -E '^\+' | grep -vE '^\+\+\+' \
+         | grep -nE "$(tr -d '\r\n' < "$patterns_file")" || true)
+  if [ -n "$hits" ]; then
+    echo "❌ 暂存内容命中 .githooks/private-patterns（前 8 行）："
+    echo "$hits" | head -8
+    fail=1
+  fi
+fi
+
+if [ "$fail" = 1 ]; then
+  echo
+  echo "处理方式：git reset -- <file> 把该文件移出暂存区并保留在工作区；"
+  echo "确需入库的，先按演示数据 / 占位符口径改写（见 README「提交纪律」与 docs/m1-spec.md）。"
+  exit 1
+fi
+exit 0

@@ -1,4 +1,8 @@
-"""地点一等字段测试（真实 SQLite + 真实 HTTP 往返）。
+"""地点一等字段测试（真实 SQLite + 真实 HTTP 往返，合成数据集驱动）。
+
+数据来源：tools/seed_demo.py 在每个用例内生成合成数据集（固定随机种子），
+仓库内不含任何数据文件。所有断言相对生成的数据集做结构校验，不绑定任何
+固定金额/账户名/日期；地点字段通过 API 写入后再回读（数据集本身不含 location）。
 
 覆盖：
 1. 迁移幂等
@@ -9,7 +13,10 @@
 6. 未观测期键缺失
 7. metrics/locations 聚合
 8. backfill dry-run/apply/冲突/幂等/不改 note
-9. 锚点不破
+9. 锚点不破（服务端重算 == 明细合计 + 期数守恒）
+额外：
+0. 地点专用窄接口：只改地点、明细一字不动；整期 PUT 漏 items 必须被拒绝
+0b. 逆地理编码落到城市级（display_name 长串不能直接当地点）
 """
 from __future__ import annotations
 
@@ -28,13 +35,18 @@ import urllib.request
 from pathlib import Path
 
 BACKEND = Path(__file__).resolve().parents[1]
-if str(BACKEND) not in sys.path:
-    sys.path.insert(0, str(BACKEND))
+ROOT = BACKEND.parent
+for extra in (BACKEND, ROOT / "tools"):
+    if str(extra) not in sys.path:
+        sys.path.insert(0, str(extra))
 
-from app import api, config, domain
-from app.store import Store
+import seed_demo  # noqa: E402
 
-SOURCE = BACKEND.parent / "data" / "out"
+from app import api, config, domain  # noqa: E402
+from app.store import Store  # noqa: E402
+
+SEED = 20260101
+PERIODS = 24
 
 
 class ServerHandle:
@@ -74,23 +86,25 @@ class ServerHandle:
         return self.request("GET", path, None, token)
 
 
-def _make_server_with_import(tmpdir: Path, with_locations: bool = False):
-    """创建导入 62 期数据的临时服务，返回 (handle, token)。"""
+def _make_synthetic_server(tmpdir: Path):
+    """在 tmpdir 下生成合成数据集并导入，启动临时服务，返回 (handle, token, meta, dataset_dir)。"""
     db = tmpdir / f"nw-{os.getpid()}-{id(tmpdir)}.db"
+    dataset = tmpdir / "dataset"
+    meta = seed_demo.generate_dataset(dataset, periods=PERIODS, seed=SEED)
     os.environ["NETWORTH_DB"] = str(db)
     os.environ["NETWORTH_SECRET"] = "unit-test-secret-loc"
-    os.environ["NETWORTH_M0_OUT"] = str(SOURCE)
+    os.environ["NETWORTH_M0_OUT"] = str(dataset)
     os.environ.pop("ALLOW_REGISTRATION", None)
     from app import importer as _importer
-    rc = _importer.main(["--source", str(SOURCE), "--db", str(db), "--quiet"])
+
+    rc = _importer.main(["--source", str(dataset), "--db", str(db), "--quiet"])
     assert rc == 0
     srv = ServerHandle(db)
-    # 注册登录
     srv.request("POST", "/api/auth/register", {"username": "loc-admin", "password": "loc-pass-123"})
     status, payload = srv.request("POST", "/api/auth/login", {"username": "loc-admin", "password": "loc-pass-123"})
     assert status == 200, payload
     token = payload["token"]
-    return srv, token
+    return srv, token, meta, dataset
 
 
 class LocationTests(unittest.TestCase):
@@ -98,11 +112,11 @@ class LocationTests(unittest.TestCase):
     # 0. 地点专用窄接口：只改地点、明细一字不动；整期 PUT 漏 items 必须被拒绝（防静默清空）
     def test_location_dedicated_write_never_touches_items(self):
         tmpdir = Path(tempfile.mkdtemp(prefix="loc-set-"))
-        srv, token = _make_server_with_import(tmpdir)
+        srv, token, meta, _ = _make_synthetic_server(tmpdir)
         try:
             accounts = srv.get("/api/accounts", token=token)[1]["accounts"]
             a1, a2 = accounts[0]["id"], accounts[1]["id"]
-            d = "2021-06-10"
+            d = "2026-06-10"
             body = {
                 "date": d,
                 "items": [{"account_id": a1, "amount_cny": 1234.5, "note": "原始备注"},
@@ -117,7 +131,7 @@ class LocationTests(unittest.TestCase):
             # 专用接口改地点
             st, payload = srv.request("PUT", f"/api/snapshots/{d}/location",
                                       {"location": {"text": "SynthCityB", "source": "manual",
-                                                    "observed_at": "2021-06-10T12:00:00+08:00"}}, token=token)
+                                                    "observed_at": "2026-06-10T12:00:00+08:00"}}, token=token)
             self.assertEqual(st, 200, payload)
             after = srv.get(f"/api/snapshots/{d}", token=token)[1]
             self.assertEqual(after["snapshot"]["location"]["text"], "SynthCityB")
@@ -253,37 +267,26 @@ class LocationTests(unittest.TestCase):
     # 2. carry-forward 取最近且有地点的期
     def test_carry_forward_location(self):
         tmpdir = Path(tempfile.mkdtemp(prefix="loc-cf-"))
-        srv, token = _make_server_with_import(tmpdir)
+        srv, token, meta, _ = _make_synthetic_server(tmpdir)
         try:
-            # 先创建带地点的期
             accounts = srv.get("/api/accounts", token=token)[1]["accounts"]
             aid = accounts[0]["id"]
-            # 2021-01-01 SynthCityA, 2021-02-01 SynthCityB, 2021-03-01 无地点, 2021-04-01 SynthCityC
-            for d, loc in [("2021-01-10", "SynthCityA"), ("2021-02-10", "SynthCityB"), ("2021-04-10", "SynthCityC")]:
+            # 创建带地点的期：2026-01-15 SynthCityA, 2026-02-15 SynthCityB, 2026-04-15 SynthCityC；2026-03-15 无地点
+            for d, loc in [("2026-01-15", "SynthCityA"), ("2026-02-15", "SynthCityB"), ("2026-04-15", "SynthCityC")]:
                 body = {"date": d, "items": [{"account_id": aid, "amount_cny": 1000}], "location": {"text": loc, "source": "manual"}}
                 status, payload = srv.request("PUT", f"/api/snapshots/{d}", body, token=token)
                 self.assertEqual(status, 200, payload)
-            # 再建一个无地点的期 2021-03-10
-            status, _ = srv.request("PUT", "/api/snapshots/2021-03-10", {"date": "2021-03-10", "items": [{"account_id": aid, "amount_cny": 1000}]}, token=token)
+            # 再建一个无地点的期 2026-03-15
+            status, _ = srv.request("PUT", "/api/snapshots/2026-03-15", {"date": "2026-03-15", "items": [{"account_id": aid, "amount_cny": 1000}]}, token=token)
             self.assertEqual(status, 200)
-            # carry-forward 目标为 2021-04-11（严格早于 2021-04-11 的最近有地点是 2021-04-10）
-            # 但我们用 carry-forward 不带 from，取最后一期（2025-08-18 或 2021-04-10 之后？）实际最后一期是真实数据 2025-08-18 无地点，所以最近有地点期可能是 2021-04-10
-            # 为了 deterministic，我们用 from 参数 + 新日期场景：直接测试 _find_location_before 逻辑通过 API  carry-forward 的 date_default
-            # 简化：新建一个期 2021-05-01 为目标，携带的应是 2021-04-10
-            # 我们通过直接调用 domain 层更精确：但这里测试 API 的 location_default 存在且 from_date 严格早于目标
-            status, cf = srv.request("POST", "/api/snapshots/carry-forward", {"from": "2021-04-10"}, token=token)
+            # carry-forward with from → 应取 2026-04-15（严格早于建议日期的最近有地点）
+            status, cf = srv.request("POST", "/api/snapshots/carry-forward", {"from": "2026-04-15"}, token=token)
             self.assertEqual(status, 200)
-            # date_default 可能是 today，建议日期远大于 2021-04-10，所以 location_default 应为 2021-04-10
             self.assertIn("location_default", cf)
             self.assertEqual(cf["location_default"]["text"], "SynthCityC")
             self.assertEqual(cf["location_default"]["source"], "carried")
-            self.assertEqual(cf["location_default"]["from_date"], "2021-04-10")
-            # 严格早于：若目标期就是 2021-04-10 本身，不应取自身
-            # 我们模拟：创建一个 2021-02-15 无地点的期，carry-forward 的目标若为 2021-02-10，检查不取自身
-            # 更直接：当库中只有一个地点在 2021-01-10，目标为 2021-01-10 时应无
-            # 这里用空库场景单独测
-            # 无则键缺失
-            # 创建空库
+            self.assertEqual(cf["location_default"]["from_date"], "2026-04-15")
+            # 无则键缺失：空库场景
             with tempfile.TemporaryDirectory(prefix="loc-empty-") as tmp2:
                 db2 = Path(tmp2) / "empty.db"
                 store2 = Store(db2)
@@ -308,12 +311,12 @@ class LocationTests(unittest.TestCase):
     # 3. 保存显式 location 后回读一致；再次 carry-forward 返回 carried 且不覆盖
     def test_save_and_read_location(self):
         tmpdir = Path(tempfile.mkdtemp(prefix="loc-save-"))
-        srv, token = _make_server_with_import(tmpdir)
+        srv, token, meta, _ = _make_synthetic_server(tmpdir)
         try:
             accounts = srv.get("/api/accounts", token=token)[1]["accounts"]
             aid = accounts[0]["id"]
-            date = "2021-06-01"
-            loc = {"text": "SynthCityX", "source": "manual", "observed_at": "2021-06-01T12:00:00Z", "lat": 30.5, "lon": 120.1, "accuracy_m": 50}
+            date = "2026-06-15"
+            loc = {"text": "SynthCityX", "source": "manual", "observed_at": "2026-06-15T12:00:00Z", "lat": 30.5, "lon": 120.1, "accuracy_m": 50}
             body = {"date": date, "items": [{"account_id": aid, "amount_cny": 2000}], "location": loc}
             status, saved = srv.request("PUT", f"/api/snapshots/{date}", body, token=token)
             self.assertEqual(status, 200, saved)
@@ -351,27 +354,27 @@ class LocationTests(unittest.TestCase):
     # 4. source 白名单
     def test_location_source_validation(self):
         tmpdir = Path(tempfile.mkdtemp(prefix="loc-validate-"))
-        srv, token = _make_server_with_import(tmpdir)
+        srv, token, meta, _ = _make_synthetic_server(tmpdir)
         try:
             accounts = srv.get("/api/accounts", token=token)[1]["accounts"]
             aid = accounts[0]["id"]
             # 非法 source
-            status, payload = srv.request("PUT", "/api/snapshots/2021-07-01", {"date": "2021-07-01", "items": [{"account_id": aid, "amount_cny": 1000}], "location": {"text": "Foo", "source": "invalid"}}, token=token)
+            status, payload = srv.request("PUT", "/api/snapshots/2026-07-01", {"date": "2026-07-01", "items": [{"account_id": aid, "amount_cny": 1000}], "location": {"text": "Foo", "source": "invalid"}}, token=token)
             self.assertEqual(status, 400)
             self.assertEqual(payload["error"]["code"], "bad_location")
             # device 缺 lat/lon
-            status, payload = srv.request("PUT", "/api/snapshots/2021-07-02", {"date": "2021-07-02", "items": [{"account_id": aid, "amount_cny": 1000}], "location": {"text": "Foo", "source": "device"}}, token=token)
+            status, payload = srv.request("PUT", "/api/snapshots/2026-07-02", {"date": "2026-07-02", "items": [{"account_id": aid, "amount_cny": 1000}], "location": {"text": "Foo", "source": "device"}}, token=token)
             self.assertEqual(status, 400)
             self.assertEqual(payload["error"]["code"], "bad_location")
             # parsed_note 经 API 拒绝
-            status, payload = srv.request("PUT", "/api/snapshots/2021-07-03", {"date": "2021-07-03", "items": [{"account_id": aid, "amount_cny": 1000}], "location": {"text": "Foo", "source": "parsed_note"}}, token=token)
+            status, payload = srv.request("PUT", "/api/snapshots/2026-07-03", {"date": "2026-07-03", "items": [{"account_id": aid, "amount_cny": 1000}], "location": {"text": "Foo", "source": "parsed_note"}}, token=token)
             self.assertEqual(status, 400)
             self.assertEqual(payload["error"]["code"], "bad_location")
             # lat 超范围
-            status, payload = srv.request("PUT", "/api/snapshots/2021-07-04", {"date": "2021-07-04", "items": [{"account_id": aid, "amount_cny": 1000}], "location": {"text": "Foo", "source": "manual", "lat": 100, "lon": 0}}, token=token)
+            status, payload = srv.request("PUT", "/api/snapshots/2026-07-04", {"date": "2026-07-04", "items": [{"account_id": aid, "amount_cny": 1000}], "location": {"text": "Foo", "source": "manual", "lat": 100, "lon": 0}}, token=token)
             self.assertEqual(status, 400)
             # text 空
-            status, payload = srv.request("PUT", "/api/snapshots/2021-07-05", {"date": "2021-07-05", "items": [{"account_id": aid, "amount_cny": 1000}], "location": {"text": "   ", "source": "manual"}}, token=token)
+            status, payload = srv.request("PUT", "/api/snapshots/2026-07-05", {"date": "2026-07-05", "items": [{"account_id": aid, "amount_cny": 1000}], "location": {"text": "   ", "source": "manual"}}, token=token)
             self.assertEqual(status, 400)
         finally:
             srv.close()
@@ -382,7 +385,7 @@ class LocationTests(unittest.TestCase):
     # 5. reverse
     def test_reverse(self):
         tmpdir = Path(tempfile.mkdtemp(prefix="loc-reverse-"))
-        srv, token = _make_server_with_import(tmpdir)
+        srv, token, meta, _ = _make_synthetic_server(tmpdir)
         try:
             # provider=off 默认 -> 409
             os.environ["NETWORTH_GEOCODE_PROVIDER"] = "off"
@@ -392,9 +395,11 @@ class LocationTests(unittest.TestCase):
             # 用注入 fake fetcher 成功 -> 通过 domain 层直接测试缓存与单次调用
             from app import geocode as _geocode
             calls = []
+
             def fake(lat, lon):
                 calls.append((lat, lon))
                 return "FakeCity", '{"display_name":"FakeCity"}'
+
             os.environ["NETWORTH_GEOCODE_PROVIDER"] = "nominatim"
             # 第一次应走 fetcher
             res1 = domain.location_reverse(srv.store, 30.0, 120.0, fetcher=fake)
@@ -409,6 +414,7 @@ class LocationTests(unittest.TestCase):
             # fetcher 抛错 -> 502 且不写缓存
             def bad(lat, lon):
                 raise _geocode.GeocodeUnavailable("network down")
+
             with self.assertRaises(domain.DomainError) as ctx:
                 domain.location_reverse(srv.store, 31.0, 121.0, fetcher=bad)
             self.assertEqual(ctx.exception.status, 502)
@@ -424,15 +430,15 @@ class LocationTests(unittest.TestCase):
     # 6. 未观测期
     def test_unrecorded(self):
         tmpdir = Path(tempfile.mkdtemp(prefix="loc-unrec-"))
-        srv, token = _make_server_with_import(tmpdir)
+        srv, token, meta, _ = _make_synthetic_server(tmpdir)
         try:
-            # 随机一个无地点的期
-            status, detail = srv.get("/api/snapshots/2020-12-20", token=token)
+            pick = meta["dates"][0]
+            status, detail = srv.get(f"/api/snapshots/{pick}", token=token)
             self.assertEqual(status, 200)
             self.assertNotIn("location", detail["snapshot"])
             self.assertIn("location_absent_reason", detail["snapshot"])
             status, lst = srv.get("/api/snapshots", token=token)
-            row = next(r for r in lst["snapshots"] if r["date"] == "2020-12-20")
+            row = next(r for r in lst["snapshots"] if r["date"] == pick)
             self.assertNotIn("location", row)
             self.assertIn("location_absent_reason", row)
         finally:
@@ -444,11 +450,11 @@ class LocationTests(unittest.TestCase):
     # 7. metrics/locations
     def test_metrics_locations(self):
         tmpdir = Path(tempfile.mkdtemp(prefix="loc-metrics-"))
-        # 用干净库，避免真实数据的干扰
+        # 用干净库，避免合成数据的干扰
         db = Path(tmpdir) / "m.db"
         os.environ["NETWORTH_DB"] = str(db)
         os.environ["NETWORTH_SECRET"] = "secret-metrics"
-        os.environ["NETWORTH_M0_OUT"] = str(SOURCE)
+        os.environ["NETWORTH_M0_OUT"] = str(tmpdir)
         store = Store(db)
         srv = ServerHandle(db)
         srv.request("POST", "/api/auth/register", {"username": "m", "password": "pass123"})
@@ -465,6 +471,7 @@ class LocationTests(unittest.TestCase):
                 if loc:
                     body["location"] = {"text": loc, "source": "manual"}
                 return srv.request("PUT", f"/api/snapshots/{date}", body, token=token)
+
             put("2021-01-01", 100, "SynthA")
             put("2021-02-01", 200, "SynthA")
             put("2021-03-01", 300)  # 无地点
@@ -502,7 +509,7 @@ class LocationTests(unittest.TestCase):
         db = Path(tmpdir) / "bf.db"
         os.environ["NETWORTH_DB"] = str(db)
         os.environ["NETWORTH_SECRET"] = "bf-secret"
-        os.environ["NETWORTH_M0_OUT"] = str(SOURCE)
+        os.environ["NETWORTH_M0_OUT"] = str(tmpdir)
         store = Store(db)
         # 创建账户
         acc_id = store.create_account("BF_Acc1", "asset", category="测试")
@@ -574,9 +581,10 @@ class LocationTests(unittest.TestCase):
         把它重新提交进 git。重算一致性 + 明细条数守恒同样能抓住「净值口径被改坏」的回归。
         """
         tmpdir = Path(tempfile.mkdtemp(prefix="loc-anchor-"))
-        srv, token = _make_server_with_import(tmpdir)
+        srv, token, meta, _ = _make_synthetic_server(tmpdir)
         try:
-            for date_text in ("2025-08-18", "2020-12-20", "2024-09-04"):
+            picks = (meta["dates"][0], meta["dates"][len(meta["dates"]) // 2], meta["dates"][-1])
+            for date_text in picks:
                 status, payload = srv.get(f"/api/snapshots/{date_text}", token=token)
                 self.assertEqual(status, 200, date_text)
                 snap, items = payload["snapshot"], payload["items"]
@@ -584,7 +592,9 @@ class LocationTests(unittest.TestCase):
                 self.assertAlmostEqual(snap["networth"], total, places=2,
                                        msg=f"{date_text} 净值必须等于本期明细合计")
                 self.assertEqual(snap["item_count"], len(items), date_text)
-            self.assertGreaterEqual(len(srv.get("/api/snapshots", token=token)[1]["snapshots"]), 62)
+                # 额外校验：明细合计应与生成数据集的 computed 一致（相对断言，非硬编码）
+                self.assertAlmostEqual(snap["networth"], meta["computed"][date_text], places=2)
+            self.assertGreaterEqual(len(srv.get("/api/snapshots", token=token)[1]["snapshots"]), meta["period_count"])
         finally:
             srv.close()
             shutil.rmtree(tmpdir, ignore_errors=True)

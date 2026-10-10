@@ -15,10 +15,10 @@
 - 不写 secret 到仓库；DB 路径与 token 密钥从环境变量读取，未设置时用本地默认值。
 - 不改动项目目录之外的任何文件。
 
-## 1. 计算规则（已用 62 期历史验证）
+## 1. 计算规则
 
 - **净资产 = Σ 该期所有明细行的有符号 `amount_cny`**（负债行通常为负；负债块里允许出现正号行，
-  例如某期「私人借款 +4000」、另一期「某信用卡 +3135」这类原表写法）。
+  例如原表里写成「某笔私人借款 +4000」「某张信用卡 +3135」这类形态）。
   该口径与服务端的逐期重算逐期零差异，是唯一正确的复现口径。
 - `total_assets = Σ amount`（kind=asset）
 - `total_liabilities = Σ amount`（kind=liability，通常为负数）
@@ -93,6 +93,10 @@ CREATE UNIQUE INDEX snapshot_item_uq ON snapshot_item(snapshot_id, account_id);
 - 真实 HTTP 往返：临时用户注册 → 登录 → carry-forward → 保存新快照 → 净值点增加 →
   `GET /api/export` → 导入全新 DB → 各表计数一致 → 删除临时数据
 - 导入后 `/api/metrics/networth` 的点数必须等于数据集期数，且与 `reconcile.json` 的 `computed` 全部一致
+- **测试不得依赖真实数据**：`tests/` 下每个测试文件都必须在运行时用 `tools/seed_demo.py`
+  的 `generate_dataset()` 生成合成数据集，断言写成相对该数据集的结构化断言；
+  任何写死金额/日期/账户名，或直接读 `data/out/` 的测试都算门禁不通过
+  （`data/out/` 是使用者本地的真实解析产物，永不入库）
 
 前端：
 - `node .bin/vue-tsc -b`（或 `tsc --noEmit`）+ `vite build` 通过，产出 `frontend/dist/index.html` 与 `assets/*`
@@ -110,12 +114,27 @@ CREATE UNIQUE INDEX snapshot_item_uq ON snapshot_item(snapshot_id, account_id);
 
 ```
 networth/
-├─ backend/app/{__init__,config,store,domain,importer,api,server}.py
-├─ backend/tests/test_api.py  backend/data/（DB，git 忽略）
+├─ backend/app/{__init__,config,store,domain,importer,api,server,fx,location_backfill,token_cli}.py
+├─ backend/tests/{test_api,test_location,test_mcp}.py   backend/data/（DB，git 忽略）
 ├─ backend/run.sh            # 启动脚本（读 env，绑定 127.0.0.1:8972）
-├─ backend/../tools/seed_demo.py   # 演示数据生成（仓库不含数据文件）
+├─ tools/seed_demo.py        # 演示数据生成（仓库不含数据文件）
 ├─ frontend/{package.json,vite.config.ts,tsconfig.json,index.html,src/…}
+├─ frontend/src/mock/        # dev-only mock（演示数据驱动，生产构建被摇掉）
 ├─ frontend/dist/（构建产物）
-├─ scripts/xlsx_lite.py     # 标准库 xlsx 读取，供自写导入脚本复用
-└─ deploy/{nginx.conf.template,networth-api.service,backup.py,deploy-web.sh}
+├─ mcp/                      # 标准库 MCP 桥接（只转发到后端 HTTP API）
+├─ scripts/xlsx_lite.py      # 标准库 xlsx 读取，供自写导入脚本复用
+├─ .githooks/pre-commit      # 提交前门禁：真实数据永不入库
+└─ deploy/{render.sh,nginx.conf.template,*.service,backup.py,deploy-web.sh}
 ```
+
+## 8. 地点与定位
+
+本节为「地点（location）」一等字段契约（前后端与 MCP 共用）。
+
+- **存储**：`snapshot` 表新增 `location_text TEXT, location_source TEXT, location_observed_at TEXT, location_lat REAL, location_lon REAL, location_accuracy_m REAL`；新增 `geocode_cache(provider, lat_key, lon_key, text, fetched_at, raw, UNIQUE(provider,lat_key,lon_key))`。迁移幂等：`PRAGMA table_info` 检查缺失列后 `ALTER TABLE ADD COLUMN`，并在 `meta` 记录 `schema_version=2`；重复调用无副作用，绝不 DROP/重建。
+- **对象**：`snapshot.location? : {text, source, observed_at: ISO8601|null, lat: number|null, lon: number|null, accuracy_m: number|null}`，`source ∈ {manual,carried,device,parsed_note}`。未观测时 `location` 键缺失，改给 `location_absent_reason="not_recorded"`，绝不补空字符串/0/猜测。
+- **读写**：`GET /api/snapshots` 列表行与 `GET /api/snapshots/{date}` 详情均包含上述语义；`POST /api/snapshots` 与 `PUT /api/snapshots/{date}` 可选 `location`，服务端校验（白名单、text 非空、lat∈[-90,90] lon∈[-180,180]、device 必带坐标、parsed_note 仅 CLI，非法→400 `bad_location`）。
+- **自动带入**：`POST /api/snapshots/carry-forward` 响应新增可选 `location_default: {text, source:"carried", from_date}`，取严格早于目标期的最近有地点期；无则键缺失+`location_absent_reason`。自动带入永不覆盖已手动改过的值（`store.upsert_snapshot` 仅在显式提供地点时才覆盖）。
+- **逆地理**：`GET /api/location/reverse?lat=&lon=[&refresh=1]`（需登录），provider 由 `NETWORTH_GEOCODE_PROVIDER` 决定（`off`(默认)|`nominatim`|`amap`），`off→409 provider_disabled`，`amap` 无 `NETWORTH_AMAP_KEY→409 provider_not_configured`，抓取失败→502 `geocode_failed` 且绝不编造；坐标出网前按约 1km 网格粗化（`lat_key/lon_key` 保留 2 位小数），命中缓存直接返回 `cached:true` 且不重复出网；`nominatim` 带 `User-Agent` 且限速 ≤1 次/秒。解析结果必须落到**城市级**（去掉末尾的「市」，否则 provider 的写法与用户手填会在 `metrics/locations` 里裂成两组）。
+- **指标**：`GET /api/metrics/locations → {groups:[{text,periods,first_date,last_date,networth_change,stays:[{from,to,periods}]}], unrecorded_periods}`，`stays` 为同一地点连续区间，未观测期仅计入 `unrecorded_periods`。
+- **回填**：`python3 -m app.location_backfill [--db PATH] [--apply]` 默认 dry-run；从 `snapshot_item.note` 解析 `地点[:：]文本`，同期多账户同值记一条、不同值冲突不写、只填 `location_text IS NULL` 的期、写入 `source=parsed_note` 且不改 `note` 一个字符、幂等。

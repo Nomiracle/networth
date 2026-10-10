@@ -76,3 +76,15 @@ http.interceptors.response.use(
     return Promise.reject(apiError)
   },
 )
+
+/**
+ * dev-only 本地 mock（合成演示数据，生产构建不含）。
+ * 关闭：VITE_MOCK=0
+ */
+export async function installDevMock(): Promise<void> {
+  if (!import.meta.env.DEV) return
+  if (import.meta.env.VITE_MOCK === '0') return
+  const { createMockAdapter } = await import('@/mock')
+  http.defaults.adapter = createMockAdapter()
+  console.info('[networth] dev mock API 已启用（VITE_MOCK=0 关闭，生产构建不含 mock）')
+}

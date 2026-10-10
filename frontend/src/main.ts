@@ -7,7 +7,7 @@ import '@/styles/main.css'
 import App from './App.vue'
 import router from './router'
 import { useAuthStore } from './stores/auth'
-import { setUnauthorizedHandler } from './api/client'
+import { installDevMock, setUnauthorizedHandler } from './api/client'
 
 const app = createApp(App)
 app.use(createPinia())
@@ -22,6 +22,7 @@ const auth = useAuthStore()
  * 3. 挂载后路由守卫决定渲染登录页还是主界面
  */
 async function start(): Promise<void> {
+  await installDevMock()
   await auth.bootstrap()
 
   setUnauthorizedHandler(() => {

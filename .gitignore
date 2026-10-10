@@ -8,10 +8,16 @@ backend/.env
 frontend/node_modules
 frontend/dist
 node_modules/
-data/out/
-data/source/
 *.log
 .DS_Store
 
 deploy/local.env
 deploy/rendered/
+
+# 使用者本地的私有数据与本机配置：永不入库。
+# 为什么必须显式写在这里：仓库历史曾因真实财务数据外泄被重写，
+# 少一条 data/source/ 规则，下一次 `git add -A` 就会把真实表格重新吸进历史。
+data/source/
+data/out/
+docs/private/
+.githooks/private-patterns
