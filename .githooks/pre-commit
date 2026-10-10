@@ -48,15 +48,18 @@ if git diff --cached --name-only --diff-filter=ACM | grep -q '^frontend/src/mock
 fi
 
 # 4) 使用者本地的私有模式（一行扩展正则，不入库）
+#    只报「哪个文件命中几处」，不回显命中行：守卫本身不能变成泄漏通道。
 patterns_file=".githooks/private-patterns"
 if [ -s "$patterns_file" ]; then
   # 只扫新增行：修正历史时会删掉含真实数据的旧行，扫全 diff 会误报
-  hits=$(git diff --cached --unified=0 \
-         | grep -E '^\+' | grep -vE '^\+\+\+' \
-         | grep -nE "$(tr -d '\r\n' < "$patterns_file")" || true)
-  if [ -n "$hits" ]; then
-    echo "❌ 暂存内容命中 .githooks/private-patterns（前 8 行）："
-    echo "$hits" | head -8
+  hit_files=$(git diff --cached --unified=0 \
+    | awk -v pat="$(tr -d '\r\n\\' < "$patterns_file")" '
+        /^\+\+\+ b\//      { f = substr($0, 7) }
+        /^\+/ && $0 !~ /^\+\+\+/ { if ($0 ~ pat) c[f]++ }
+        END                { for (k in c) printf "%s(%d次) ", k, c[k] }' || true)
+  if [ -n "$hit_files" ]; then
+    echo "❌ 暂存内容命中 .githooks/private-patterns（只列文件名与命中数，不回显内容）："
+    echo "  $hit_files"
     fail=1
   fi
 fi
