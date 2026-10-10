@@ -18,6 +18,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { fmtCompact, fmtMoney, fmtPct, fmtSigned, todayISO, trendClass } from '@/utils/format'
 import { DEFAULT_TAXONOMY, confirmNewTaxonomy } from '@/utils/taxonomy'
 import CategoryPicker from '@/components/CategoryPicker.vue'
+import { cloneRows as cloneEditRows, isSameEdit } from '@/utils/snapshotEditState'
 
 interface EditRow {
   key: string
@@ -65,7 +66,7 @@ const errText = ref('')
 const rows = ref<EditRow[]>([])
 const accounts = ref<Account[]>([])
 const formDate = ref(todayISO())
-const fxRate = ref(settings.defaultFxRate)
+const fxRate = ref<string | number>(settings.defaultFxRate)
 const marketNote = ref('')
 const status = ref<'draft' | 'final'>('final')
 // 地点：与 marketNote 同级的一等字段
@@ -80,8 +81,12 @@ const locationTouched = ref(false) // 用户手动改过，自动带入不得覆
 const locationLoading = ref(false)
 const locationError = ref('')
 const locationDefault = ref<{ text: string; from_date: string } | null>(null)
-/** 进入页面时的状态指纹，用于未保存改动检测 */
+/** 保存基线：用于 dirty/撤销（包含全部可持久化编辑态） */
 const savedFingerprint = ref('')
+// 深拷贝的保存行快照，用于行级 dirty 与撤销恢复
+const savedRowsSnapshot = ref<EditRow[]>([])
+// 表单级保存快照（用于 formDirty 独立指示）——包含全部地点持久化字段及 touched 辅助态
+const savedFormSnapshot = ref<{ fxRate: string | number; marketNote: string; locationText: string; locationSource: string; locationLat: number | null; locationLon: number | null; locationObservedAt: string | null; locationAccuracy: number | null; locationTouched: boolean; status: string; formDate: string } | null>(null)
 const mode = ref<'new' | 'edit'>('new')
 const filterText = ref('')
 const onlyChanged = ref(false)
@@ -258,50 +263,70 @@ function onCreditInput(r: EditRow): void {
 const creditSaving = ref<Record<number, boolean>>({})
 
 async function saveCreditRow(r: EditRow): Promise<void> {
-  if (!isCreditRow(r)) return
+  if (!isCreditRow(r) || saving.value || loading.value) return
   if (isCreditInvalid(r)) {
     ElMessage.warning('额度为空可不填，已填必须为非负数（最多两位小数）')
     return
   }
   const lim = parseCredit(r.credit_limit)
   const avail = parseCredit(r.credit_available)
-  // 至少填一个
   if (lim === null && avail === null) {
     ElMessage.warning('总额度与剩余额度至少填一个（都为空将清空该行额度）')
-    // 仍允许清空：显式发 null
   }
   if (mode.value !== 'edit') {
     ElMessage.warning('仅已保存的期次可单独保存额度；新期请直接“提交本期快照”一并保存')
     return
   }
-  creditSaving.value = { ...creditSaving.value, [r.account_id]: true }
+  // 捕获提交时刻的标识与输入，避免异步期间被用户改写
+  const submittedDate = formDate.value
+  const submittedLoadSeq = loadSeq
+  const submittedAccountId = r.account_id
+  const submittedLimitStr = r.credit_limit
+  const submittedAvailStr = r.credit_available
+  const rowRef = r
+  if (creditSaving.value[submittedAccountId]) return
+  creditSaving.value = { ...creditSaving.value, [submittedAccountId]: true }
   try {
     const payload: { credit_limit_cny?: number | null; credit_available_cny?: number | null } = {}
-    // 空字符串 => null（清空），否则数字
-    payload.credit_limit_cny = r.credit_limit.trim() === '' ? null : (lim as number)
-    payload.credit_available_cny = r.credit_available.trim() === '' ? null : (avail as number)
-    // 若两列都为空，仍发送两个 null 以清空
-    const res = await updateSnapshotCredit(formDate.value, r.account_id, payload)
-    // 后端返回 SnapshotDetail，刷新该行派生值
-    const updated = (res as SnapshotDetail).items?.find((it) => it.account_id === r.account_id)
-    if (updated) {
-      r.orig_credit_limit = typeof updated.credit_limit_cny === 'number' ? updated.credit_limit_cny : null
-      r.orig_credit_available = typeof updated.credit_available_cny === 'number' ? updated.credit_available_cny : null
-      r.credit_limit = typeof updated.credit_limit_cny === 'number' ? String(updated.credit_limit_cny) : ''
-      r.credit_available = typeof updated.credit_available_cny === 'number' ? String(updated.credit_available_cny) : ''
-      r.credit_mismatch = (updated as unknown as { credit_mismatch?: boolean | null }).credit_mismatch ?? null
-      r.credit_absent_reason = (updated as unknown as { credit_absent_reason?: string | null }).credit_absent_reason ?? null
-    } else {
-      // 回退：按本地提交值更新 orig
-      r.orig_credit_limit = payload.credit_limit_cny ?? null
-      r.orig_credit_available = payload.credit_available_cny ?? null
-      r.credit_mismatch = null
+    payload.credit_limit_cny = submittedLimitStr.trim() === '' ? null : (lim as number)
+    payload.credit_available_cny = submittedAvailStr.trim() === '' ? null : (avail as number)
+    const res = await updateSnapshotCredit(submittedDate, submittedAccountId, payload)
+    // stale 保护：期间已切期则不触碰新期基线
+    if (submittedDate !== formDate.value || submittedLoadSeq !== loadSeq) return
+    const stillSameRow = rows.value.find(x => x.account_id === submittedAccountId) === rowRef
+    const updated = (res as SnapshotDetail).items?.find((it) => it.account_id === submittedAccountId)
+    if (!updated) {
+      ElMessage.error('额度保存返回缺少该行，请刷新后重试')
+      return
     }
-    ElMessage.success(`额度已保存：${r.account}`)
+    const canonicalLimit = typeof updated.credit_limit_cny === 'number' ? updated.credit_limit_cny : null
+    const canonicalAvail = typeof updated.credit_available_cny === 'number' ? updated.credit_available_cny : null
+    const canonicalMismatch = (updated as unknown as { credit_mismatch?: boolean | null }).credit_mismatch ?? null
+    const canonicalAbsent = (updated as unknown as { credit_absent_reason?: string | null }).credit_absent_reason ?? null
+    // 仅当用户未再次改动该行额度输入时，才更新当前行显示；否则保留用户新输入，仅推进保存基线为规范值
+    const curLimitStr = rowRef.credit_limit
+    const curAvailStr = rowRef.credit_available
+    const stillSameInput = curLimitStr === submittedLimitStr && curAvailStr === submittedAvailStr
+    if (stillSameInput && stillSameRow) {
+      rowRef.orig_credit_limit = canonicalLimit
+      rowRef.orig_credit_available = canonicalAvail
+      rowRef.credit_limit = canonicalLimit !== null ? String(canonicalLimit) : ''
+      rowRef.credit_available = canonicalAvail !== null ? String(canonicalAvail) : ''
+      rowRef.credit_mismatch = canonicalMismatch
+      rowRef.credit_absent_reason = canonicalAbsent
+    } else if (stillSameRow) {
+      // 用户已改：仅更新 orig 派生，不覆盖输入
+      rowRef.orig_credit_limit = canonicalLimit
+      rowRef.orig_credit_available = canonicalAvail
+      rowRef.credit_mismatch = canonicalMismatch
+      rowRef.credit_absent_reason = canonicalAbsent
+    }
+    advanceSavedCredit(submittedAccountId, canonicalLimit, canonicalAvail, canonicalMismatch, canonicalAbsent)
+    ElMessage.success(`额度已保存：${rowRef.account}`)
   } catch (e) {
     ElMessage.error(errorText(e))
   } finally {
-    creditSaving.value = { ...creditSaving.value, [r.account_id]: false }
+    creditSaving.value = { ...creditSaving.value, [submittedAccountId]: false }
   }
 }
 
@@ -355,16 +380,121 @@ const usdAssets = computed(() => {
 const changedRows = computed(() => rows.value.filter((r) => !r.removed && isChanged(r)))
 const invalidRows = computed(() => rows.value.filter((r) => isRowInvalid(r)))
 
+/** 未保存的行：与保存基线的可持久化编辑态对比（含备注/币种/额度/增删） */
+const unsavedRows = computed(() => {
+  const savedMap = new Map<number, EditRow>()
+  for (const s of savedRowsSnapshot.value) savedMap.set(s.account_id, s)
+  const out: EditRow[] = []
+  // 当前存在但保存态没有 => 新增未保存
+  for (const r of rows.value) {
+    if (r.removed && !savedMap.has(r.account_id)) {
+      // 新增后又移除，若保存态本来就没有该行，则算干净（等价于未新增）
+      continue
+    }
+    const s = savedMap.get(r.account_id)
+    if (!s) {
+      // 保存态没有该行且当前未移除 => 新增
+      if (!r.removed) out.push(r)
+      continue
+    }
+    if (r.removed !== s.removed) { out.push(r); continue }
+    if (r.removed) continue
+    if (!isSameEdit(r, s)) out.push(r)
+  }
+  // 保存态有但当前没有（被删除的行，以 removed 标记体现，上面已处理；若真正缺失也算脏）
+  for (const s of savedRowsSnapshot.value) {
+    const cur = rows.value.find(r => r.account_id === s.account_id)
+    if (!cur && !s.removed) out.push(s)
+  }
+  return out
+})
+
+/** 表单级是否有未保存改动（汇率/备注/地点/状态/日期） */
+const formDirty = computed(() => {
+  const sf = savedFormSnapshot.value
+  if (!sf) return false
+  if (String(sf.fxRate) !== String(fxRate.value)) return true
+  if (sf.marketNote !== marketNote.value) return true
+  if (sf.locationText !== locationText.value) return true
+  if (sf.locationSource !== locationSource.value) return true
+  if (sf.locationLat !== locationLat.value) return true
+  if (sf.locationLon !== locationLon.value) return true
+  if (sf.locationObservedAt !== locationObservedAt.value) return true
+  if (sf.locationAccuracy !== locationAccuracy.value) return true
+  if (sf.status !== status.value) return true
+  if (sf.formDate !== formDate.value) return true
+  return false
+})
+
+/** 供模板展示：行数 + 表单改动独立指示，绝不 0项而脏 */
+const dirtySummary = computed(() => {
+  const n = unsavedRows.value.length
+  if (n > 0 && formDirty.value) return `${n} 项 + 表单有改动`
+  if (n > 0) return `${n} 项`
+  if (formDirty.value) return `表单有改动`
+  return `0 项`
+})
+
+// 结构化序列化：用于 autosave 指纹与保存基线比对，避免分隔符碰撞
+function serializeRows(rowsList: EditRow[]): unknown[] {
+  return [...rowsList]
+    .slice()
+    .sort((a, b) => a.account_id - b.account_id)
+    .map((r) => ({
+      account_id: r.account_id,
+      ccy: r.ccy,
+      amount: r.amount,
+      usd: r.usd,
+      ccy_touched: r.ccy_touched,
+      note: r.note,
+      credit_limit: r.credit_limit,
+      credit_available: r.credit_available,
+      removed: r.removed,
+      added: r.added,
+      orig_usd: r.orig_usd,
+      orig_fx: r.orig_fx,
+    }))
+}
+function serializeForm() {
+  return {
+    formDate: formDate.value,
+    fxRate: String(fxRate.value ?? ''),
+    marketNote: marketNote.value,
+    locationText: locationText.value,
+    locationSource: locationSource.value,
+    locationLat: locationLat.value,
+    locationLon: locationLon.value,
+    locationObservedAt: locationObservedAt.value,
+    locationAccuracy: locationAccuracy.value,
+    status: status.value,
+  }
+}
 function fingerprint(): string {
-  const body = rows.value
-    .filter((r) => !r.removed)
-    .map((r) => `${r.account_id}:${r.ccy}:${r.amount}:${r.usd}:${r.note}:${r.credit_limit}:${r.credit_available}`)
-    .join('|')
-  const loc = `${locationText.value}|${locationSource.value}|${locationLat.value}|${locationLon.value}`
-  return `${formDate.value}|${fxRate.value}|${marketNote.value}|${loc}|${status.value}|${body}`
+  return JSON.stringify({ form: serializeForm(), rows: serializeRows(rows.value) })
+}
+function serializeSaved(): string {
+  const sf = savedFormSnapshot.value
+  if (!sf) return ''
+  const form = {
+    formDate: sf.formDate,
+    fxRate: String(sf.fxRate ?? ''),
+    marketNote: sf.marketNote,
+    locationText: sf.locationText,
+    locationSource: sf.locationSource,
+    locationLat: sf.locationLat,
+    locationLon: sf.locationLon,
+    locationObservedAt: sf.locationObservedAt,
+    locationAccuracy: sf.locationAccuracy,
+    status: sf.status,
+  }
+  return JSON.stringify({ form, rows: serializeRows(savedRowsSnapshot.value) })
 }
 
-const dirty = computed(() => fingerprint() !== savedFingerprint.value)
+const dirty = computed(() => {
+  if (loading.value) return false
+  if (!savedFormSnapshot.value && savedRowsSnapshot.value.length === 0) return false
+  return unsavedRows.value.length > 0 || formDirty.value
+})
 
 /* --------------------------- 分组 --------------------------- */
 interface GroupedSub {
@@ -532,28 +662,83 @@ function collapaseAll(v: boolean): void {
   collapsed.value = map
 }
 
+/** 捕获当前为保存基线（含行与表单），用于初始化/保存成功后 */
+function captureSavedState(): void {
+  savedRowsSnapshot.value = cloneEditRows(rows.value)
+  savedFormSnapshot.value = {
+    fxRate: fxRate.value,
+    marketNote: marketNote.value,
+    locationText: locationText.value,
+    locationSource: locationSource.value,
+    locationLat: locationLat.value,
+    locationLon: locationLon.value,
+    locationObservedAt: locationObservedAt.value,
+    locationAccuracy: locationAccuracy.value,
+    locationTouched: locationTouched.value,
+    status: status.value,
+    formDate: formDate.value,
+  }
+  savedFingerprint.value = serializeSaved()
+}
+
+/** 仅推进单行的额度保存基线，其他行保持脏 */
+function advanceSavedCredit(accountId: number, canonicalLimit: number | null, canonicalAvail: number | null, mismatch: boolean | null, absentReason: string | null): void {
+  const saved = savedRowsSnapshot.value.find(r => r.account_id === accountId)
+  if (!saved) return
+  // 规范值写入保存基线，不用当前可能已再次编辑的值
+  saved.credit_limit = canonicalLimit !== null ? String(canonicalLimit) : ''
+  saved.credit_available = canonicalAvail !== null ? String(canonicalAvail) : ''
+  saved.orig_credit_limit = canonicalLimit
+  saved.orig_credit_available = canonicalAvail
+  saved.credit_mismatch = mismatch
+  saved.credit_absent_reason = absentReason
+  savedFingerprint.value = serializeSaved()
+}
+
 /* --------------------------- 汇率自动抓取 --------------------------- */
 const fxInfo = ref<FxResult | null>(null)
 const fxTouched = ref(false)   // 用户手动改过汇率：自动带出不再覆盖
 const fxLoading = ref(false)
 const fxError = ref('')
+let fxSeq = 0 // 请求序列，用于丢弃过期回包
+let fxRev = 0 // 手工修改版本号，每次手工输入递增
+let loadSeq = 0 // 加载序列，丢弃旧 load
+
+function onFxInput(v: string): void {
+  fxRate.value = v
+  fxTouched.value = true
+  fxRev++
+}
 
 /** 抓取某日 USD→CNY 汇率并填入（失败只提示，保留当前值，绝不猜） */
 async function loadFx(date: string, refresh = false): Promise<void> {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return
   if (fxTouched.value && !refresh) return
+  const seq = ++fxSeq
+  const capturedDate = date
+  const capturedRev = fxRev
+  const capturedRate = String(fxRate.value ?? '')
   fxLoading.value = true
   fxError.value = ''
   try {
     const info = await fetchFxRate(date, refresh)
+    if (seq !== fxSeq) return
+    if (capturedDate !== formDate.value) return
+    if (fxRev !== capturedRev) return
+    if (String(fxRate.value ?? '') !== capturedRate && fxTouched.value) return
+    if (!refresh && fxTouched.value) return
     fxInfo.value = info
     fxRate.value = info.rate
-    fxTouched.value = false
+    if (!refresh) fxTouched.value = false
+    else fxTouched.value = true
   } catch (e) {
+    if (seq !== fxSeq) return
+    if (capturedDate !== formDate.value) return
+    if (fxRev !== capturedRev) return
     fxInfo.value = null
     fxError.value = `${errorText(e)}（可手动填写）`
   } finally {
-    fxLoading.value = false
+    if (seq === fxSeq) fxLoading.value = false
   }
 }
 
@@ -653,52 +838,68 @@ async function useDeviceLocation(): Promise<void> {
 }
 
 async function load(forceDate?: string): Promise<void> {
+  const seq = ++loadSeq
+  // 取消排队的自动保存，避免初始化期间定时器把临时草稿写回
+  if (autosaveTimer) { window.clearTimeout(autosaveTimer); autosaveTimer = null }
+  // 取消进行中的 FX，避免旧回包覆盖新期
+  fxSeq++
+  fxLoading.value = false
   loading.value = true
   errText.value = ''
+  fxTouched.value = false
+  fxError.value = ''
   try {
     const target = forceDate ?? (typeof route.params.date === 'string' ? route.params.date : '')
     if (target) {
       try {
         const detail = await fetchSnapshot(target)
+        if (seq !== loadSeq) return
         applyDetail(detail)
-        savedFingerprint.value = fingerprint()
+        captureSavedState()
         return
       } catch (e) {
-        // 404 = 该日期还没有期次；日期本身不合法时仍要报错
+        if (seq !== loadSeq) return
         if (!isApiError(e) || e.status !== 404) throw e
         if (!/^\d{4}-\d{2}-\d{2}$/.test(target)) throw e
       }
-      // 该日期还没有期次：按最新一期结转、日期用用户选的。
-      // 此前这里把 target 当「源期次」传给结转，源不存在就直接报「源快照不存在」，
-      // 在录入页选一个新日期根本进不去。
-      applyCarry(await carryForward(), target)
-      savedFingerprint.value = fingerprint()
+      const cf = await carryForward()
+      if (seq !== loadSeq) return
+      applyCarry(cf, target)
+      fxTouched.value = false
+      await loadFx(target, false)
+      if (seq !== loadSeq) return
+      captureSavedState()
       localDraftAt.value = ''
       return
     }
-    // 服务端建议的日期：若该日期已有期次，直接打开那一期编辑（避免「再录一次」造出重复期次）
     const cf = await carryForward()
+    if (seq !== loadSeq) return
     const suggested = cf.date_default || todayISO()
     try {
-      applyDetail(await fetchSnapshot(suggested))
+      const detail = await fetchSnapshot(suggested)
+      if (seq !== loadSeq) return
+      applyDetail(detail)
+      captureSavedState()
     } catch (e) {
+      if (seq !== loadSeq) return
       if (!isApiError(e) || e.status !== 404) throw e
       applyCarry(cf, suggested)
+      fxTouched.value = false
+      await loadFx(suggested, false)
+      if (seq !== loadSeq) return
+      captureSavedState()
     }
-    savedFingerprint.value = fingerprint()
     localDraftAt.value = ''
   } catch (e) {
+    if (seq !== loadSeq) return
     errText.value = errorText(e)
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
 onMounted(async () => {
   await load()
-  // 新期次：自动带出当日汇率（已有期次保留表内值，可点「刷新」）
-  if (mode.value === 'new') await loadFx(formDate.value)
-  const snapshotBeforeReload = savedFingerprint.value
   try {
     accounts.value = await fetchAccounts()
   } catch {
@@ -717,7 +918,6 @@ onMounted(async () => {
   } catch {
     /* 忽略 */
   }
-  savedFingerprint.value = snapshotBeforeReload
 })
 
 /* 本地自动保存（仅页面级草稿，服务端草稿走「保存草稿」按钮） */
@@ -725,17 +925,17 @@ let autosaveTimer: number | null = null
 watch(
   () => (dirty.value ? fingerprint() : ''),
   () => {
+    if (loading.value) return
     if (!dirty.value) return
     if (autosaveTimer) window.clearTimeout(autosaveTimer)
     autosaveTimer = window.setTimeout(() => {
       autosaveTimer = null
-      // 触发时再判一次：定时器可能在「保存成功 → dropLocalDraft()」之后才到期，
-      // 那样会把刚清掉的草稿又写回来（实测保存后 localStorage 里仍留着草稿）
+      if (loading.value) return
       if (!dirty.value) return
       try {
         window.localStorage.setItem(
           DRAFT_KEY,
-          JSON.stringify({ at: new Date().toISOString(), date: formDate.value, rows: rows.value }),
+          JSON.stringify({ version: 2, at: new Date().toISOString(), date: formDate.value, rows: rows.value, form: { ...serializeForm(), locationTouched: locationTouched.value } }),
         )
       } catch {
         /* 忽略 */
@@ -746,9 +946,34 @@ watch(
 
 function restoreLocalDraft(): void {
   try {
-    const parsed = JSON.parse(localDraftPayload.value) as { date: string; rows: EditRow[] }
-    if (parsed.rows?.length) {
-      rows.value = parsed.rows
+    const parsed = JSON.parse(localDraftPayload.value) as { date: string; rows: EditRow[]; form?: ReturnType<typeof serializeForm> & { locationTouched?: boolean } }
+    if (parsed.date !== formDate.value || !Array.isArray(parsed.rows)) throw new Error('draft date mismatch')
+    if (parsed.rows.length) {
+      // 旧版草稿缺少额度字段：回到未观测，绝不补零，也不能直接调用 undefined.trim()。
+      rows.value = parsed.rows.map(r => ({
+        ...r,
+        credit_limit: typeof r.credit_limit === 'string' ? r.credit_limit : '',
+        credit_available: typeof r.credit_available === 'string' ? r.credit_available : '',
+        orig_credit_limit: r.orig_credit_limit ?? null,
+        orig_credit_available: r.orig_credit_available ?? null,
+        credit_mismatch: r.credit_mismatch ?? null,
+        credit_absent_reason: r.credit_absent_reason ?? null,
+      }))
+      if (parsed.form) {
+        const f = parsed.form
+        fxSeq++
+        fxLoading.value = false
+        onFxInput(String(f.fxRate))
+        marketNote.value = f.marketNote
+        locationText.value = f.locationText
+        locationSource.value = f.locationSource
+        locationLat.value = f.locationLat
+        locationLon.value = f.locationLon
+        locationObservedAt.value = f.locationObservedAt
+        locationAccuracy.value = f.locationAccuracy
+        locationTouched.value = f.locationTouched ?? true
+        status.value = f.status
+      }
       ElMessage.success('已恢复本地草稿')
     }
   } catch {
@@ -779,9 +1004,31 @@ function onRowInput(r: EditRow, v: string): void {
 }
 
 function resetRow(r: EditRow): void {
-  if (r.baseline === null) return
-  r.amount = String(r.baseline)
-  r.auto_filled = true
+  const saved = savedRowsSnapshot.value.find(s => s.account_id === r.account_id)
+  if (saved) {
+    Object.assign(r, {
+      ccy: saved.ccy,
+      amount: saved.amount,
+      usd: saved.usd,
+      ccy_touched: saved.ccy_touched,
+      note: saved.note,
+      credit_limit: saved.credit_limit,
+      credit_available: saved.credit_available,
+      orig_credit_limit: saved.orig_credit_limit,
+      orig_credit_available: saved.orig_credit_available,
+      orig_usd: saved.orig_usd,
+      orig_fx: saved.orig_fx,
+      credit_mismatch: saved.credit_mismatch,
+      credit_absent_reason: saved.credit_absent_reason,
+      auto_filled: saved.auto_filled,
+      removed: saved.removed,
+    })
+    return
+  }
+  if (r.baseline !== null) {
+    r.amount = String(r.baseline)
+    r.auto_filled = true
+  }
 }
 
 function removeRow(r: EditRow): void {
@@ -789,12 +1036,33 @@ function removeRow(r: EditRow): void {
 }
 
 function resetAll(): void {
+  // 使排队的 FX 回包失效，避免旧 FX 在撤销后又改回
+  fxSeq++
+  fxLoading.value = false
+  if (savedFormSnapshot.value) {
+    rows.value = cloneEditRows(savedRowsSnapshot.value)
+    if (savedFormSnapshot.value) {
+      fxRate.value = savedFormSnapshot.value.fxRate
+      marketNote.value = savedFormSnapshot.value.marketNote
+      locationText.value = savedFormSnapshot.value.locationText
+      locationSource.value = savedFormSnapshot.value.locationSource as any
+      locationLat.value = savedFormSnapshot.value.locationLat
+      locationLon.value = savedFormSnapshot.value.locationLon
+      locationObservedAt.value = savedFormSnapshot.value.locationObservedAt
+      locationAccuracy.value = savedFormSnapshot.value.locationAccuracy
+      locationTouched.value = savedFormSnapshot.value.locationTouched
+      status.value = savedFormSnapshot.value.status as any
+      formDate.value = savedFormSnapshot.value.formDate
+      fxTouched.value = false
+      fxRev++
+    }
+    return
+  }
   for (const r of rows.value) {
     if (r.added) r.removed = true
     else {
       r.removed = false
       resetRow(r)
-      r.note = ''
     }
   }
 }
@@ -931,6 +1199,7 @@ function buildPayload(sv: 'draft' | 'final'): SaveSnapshotPayload {
 }
 
 async function doSave(sv: 'draft' | 'final'): Promise<void> {
+  if (saving.value || loading.value || Object.values(creditSaving.value).some(Boolean)) return
   if (!/^\d{4}-\d{2}-\d{2}$/.test(formDate.value)) {
     ElMessage.warning('请选择快照日期')
     return
@@ -945,10 +1214,35 @@ async function doSave(sv: 'draft' | 'final'): Promise<void> {
   }
   saving.value = true
   status.value = sv
+  const submittedRows = cloneEditRows(rows.value)
+  const submittedForm = {
+    fxRate: fxRate.value,
+    marketNote: marketNote.value,
+    locationText: locationText.value,
+    locationSource: locationSource.value,
+    locationLat: locationLat.value,
+    locationLon: locationLon.value,
+    locationObservedAt: locationObservedAt.value,
+    locationAccuracy: locationAccuracy.value,
+    locationTouched: locationTouched.value,
+    status: sv,
+    formDate: formDate.value,
+  }
+  const submittedSerialized = fingerprint()
+  const submittedLoadSeq = loadSeq
   try {
     await saveSnapshot(buildPayload(sv))
-    savedFingerprint.value = fingerprint()
-    dropLocalDraft()
+    if (submittedLoadSeq !== loadSeq || submittedForm.formDate !== formDate.value) return
+    // 以提交时刻的快照为保存基线
+    savedRowsSnapshot.value = submittedRows
+    savedFormSnapshot.value = submittedForm
+    savedFingerprint.value = serializeSaved()
+    // 草稿保存后也进入 edit 模式，使窄额度可用于新保存的期
+    mode.value = 'edit'
+    // 仅当当前仍干净时才清本地草稿与定时器；否则保留以便恢复并发改动
+    if (fingerprint() === submittedSerialized) {
+      dropLocalDraft()
+    }
     ElMessage.success(sv === 'draft' ? `草稿已保存（${formDate.value}）` : `已提交快照（${formDate.value}）`)
     if (sv === 'final') {
       await router.replace({ name: 'snapshot', params: { date: formDate.value } })
@@ -975,7 +1269,6 @@ async function onDateChange(v: string): Promise<void> {
   }
   await router.replace({ name: 'snapshot', params: { date: v } })
   await load(v)
-  if (mode.value === 'new') await loadFx(v)
 }
 
 async function showDiff(): Promise<void> {
@@ -997,7 +1290,13 @@ function beforeUnload(e: BeforeUnloadEvent): void {
 }
 
 onMounted(() => window.addEventListener('beforeunload', beforeUnload))
-onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', beforeUnload)
+  // 离开后回包与定时器不得再次改写草稿。
+  loadSeq++
+  fxSeq++
+  if (autosaveTimer) window.clearTimeout(autosaveTimer)
+})
 
 onBeforeRouteLeave(async () => {
   if (!dirty.value) return true
@@ -1067,11 +1366,11 @@ const hasPrev = computed(() => mode.value === 'edit' || savedFingerprint.value !
               >
             </div>
             <el-input
-              v-model="fxRate"
+              :model-value="fxRate"
               type="number"
               step="0.01"
               data-testid="snapshot-fx"
-              @input="fxTouched = true"
+              @update:model-value="onFxInput"
             />
             <div class="fx-note" :class="{ warn: !!fxError }" data-testid="snapshot-fx-note">
               <template v-if="fxError">{{ fxError }}</template>
@@ -1292,7 +1591,7 @@ const hasPrev = computed(() => mode.value === 'edit' || savedFingerprint.value !
       </div>
 
       <div v-if="dirty" class="dirty-bar">
-        <span>有未保存改动（{{ changedRows.length }} 项）</span>
+        <span>有未保存改动（{{ dirtySummary }}）</span>
         <span style="flex: 1"></span>
         <el-button size="small" link @click="resetAll">全部还原</el-button>
       </div>

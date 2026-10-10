@@ -8,7 +8,8 @@
     "dev": "vite",
     "typecheck": "vue-tsc --noEmit -p tsconfig.json",
     "build": "vue-tsc --noEmit -p tsconfig.json && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test tests/snapshot-dirty.test.cjs"
   },
   "dependencies": {
     "axios": "1.18.1",
