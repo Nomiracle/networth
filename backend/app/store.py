@@ -74,7 +74,9 @@ CREATE TABLE IF NOT EXISTS snapshot_item (
   fx_rate REAL,
   note TEXT,
   auto_filled INTEGER DEFAULT 0,
-  flags TEXT
+  flags TEXT,
+  credit_limit_cny REAL,
+  credit_available_cny REAL
 );
 CREATE TABLE IF NOT EXISTS event (
   id INTEGER PRIMARY KEY,
@@ -177,12 +179,27 @@ class Store:
                         self.conn.execute(f"ALTER TABLE snapshot ADD COLUMN {col} {typ}")
                     except sqlite3.Error:
                         pass  # 并发或已存在时忽略，幂等
+            # 幂等迁移：为 snapshot_item 补充信用卡额度列（老库无这些列）
+            try:
+                item_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(snapshot_item)").fetchall()}
+            except sqlite3.Error:
+                item_cols = set()
+            credit_expected = {
+                "credit_limit_cny": "REAL",
+                "credit_available_cny": "REAL",
+            }
+            for col, typ in credit_expected.items():
+                if col not in item_cols:
+                    try:
+                        self.conn.execute(f"ALTER TABLE snapshot_item ADD COLUMN {col} {typ}")
+                    except sqlite3.Error:
+                        pass
             # 记录 schema 版本（幂等）
             try:
                 self.conn.execute(
                     "INSERT INTO meta(key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    ("schema_version", "2"),
+                    ("schema_version", "3"),
                 )
             except sqlite3.Error:
                 pass
@@ -403,7 +420,8 @@ class Store:
         rows = self._all(
             """
             SELECT s.snapshot_date AS date, i.amount_cny AS amount, i.amount_usd AS amount_usd,
-                   i.fx_rate AS fx_rate, i.note AS note, i.flags AS flags
+                   i.fx_rate AS fx_rate, i.note AS note, i.flags AS flags,
+                   i.credit_limit_cny AS credit_limit_cny, i.credit_available_cny AS credit_available_cny
             FROM snapshot_item i JOIN snapshot s ON s.id = i.snapshot_id
             WHERE i.account_id = ?
             ORDER BY s.snapshot_date
@@ -577,8 +595,9 @@ class Store:
             for item in items:
                 conn.execute(
                     """INSERT INTO snapshot_item(snapshot_id, account_id, amount_cny, amount_usd,
-                                                 fx_rate, note, auto_filled, flags)
-                       VALUES (?,?,?,?,?,?,?,?)""",
+                                                 fx_rate, note, auto_filled, flags,
+                                                 credit_limit_cny, credit_available_cny)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
                     (
                         snapshot_id,
                         int(item["account_id"]),
@@ -588,6 +607,8 @@ class Store:
                         item.get("note"),
                         int(item.get("auto_filled") or 0),
                         item.get("flags"),
+                        item.get("credit_limit_cny"),
+                        item.get("credit_available_cny"),
                     ),
                 )
         return snapshot_id, created
@@ -699,6 +720,26 @@ class Store:
             (text, source, observed_at, lat, lon, accuracy_m, date_text),
         )
         return cur.rowcount or 0
+
+    # ------------------------------------------------------------ 信用卡额度：窄接口写单行额度
+    def update_snapshot_item_credit(self, snapshot_id: int, account_id: int,
+                                     credit_limit_cny: float | None,
+                                     credit_available_cny: float | None) -> int:
+        """只更新某一期某账户的额度（其它列不动）；返回受影响行数。"""
+        cur = self._run(
+            "UPDATE snapshot_item SET credit_limit_cny=?, credit_available_cny=? "
+            "WHERE snapshot_id=? AND account_id=?",
+            (credit_limit_cny, credit_available_cny, snapshot_id, account_id),
+        )
+        return cur.rowcount or 0
+
+    def credit_observed_accounts(self) -> set[int]:
+        """已有额度观测值的账户 id 集合（用于 is_credit_card 判定）。"""
+        rows = self._all(
+            "SELECT DISTINCT account_id FROM snapshot_item "
+            "WHERE credit_limit_cny IS NOT NULL OR credit_available_cny IS NOT NULL"
+        )
+        return {int(r["account_id"]) for r in rows}
 
 
 def _json_join(flags: Any) -> str | None:

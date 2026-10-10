@@ -39,6 +39,13 @@ export interface Account {
   periods: number
   unchanged_tail: number
   is_counted: number | boolean
+  /** 信用卡账户：由 subclass == '信用卡' 或已有额度观测值决定（前端据此显示额度列） */
+  is_credit_card?: boolean
+  /** 最新一期的额度观测（未观测则键缺失） */
+  credit_limit_cny?: number | null
+  credit_available_cny?: number | null
+  credit_used_cny?: number | null
+  credit_utilization?: number | null
 }
 
 export interface AccountPoint {
@@ -50,6 +57,11 @@ export interface AccountPoint {
   fx_rate?: number | null
   /** 该期这一项的备注（原表投资日志/说明） */
   note?: string | null
+  /** 信用卡额度：未观测的期键缺失，趋势图应断开而不是插 0 */
+  credit_limit_cny?: number | null
+  credit_available_cny?: number | null
+  credit_used_cny?: number | null
+  credit_utilization?: number | null
 }
 
 export interface AccountSeries {
@@ -128,6 +140,21 @@ export interface SnapshotItem {
   fx_rate?: number | null
   note?: string | null
   auto_filled?: number | boolean | null
+  /** 信用卡额度（逐期观测）：未观测时键缺失 + credit_absent_reason，永不补 0 */
+  credit_limit_cny?: number | null
+  credit_available_cny?: number | null
+  /** 服务端派生：limit - available；两者都在才有 */
+  credit_used_cny?: number | null
+  /** 服务端派生：used / limit */
+  credit_utilization?: number | null
+  /**
+   * 原因码：两侧都未观测时为 not_recorded（信用卡）/not_credit_card（非信用卡）；
+   * 只记了一半（例如只填了总额度）时也会出现 not_recorded，表示还有未记录的部分——
+   * 此时已记的那一项照常返回，不会被吞掉
+   */
+  credit_absent_reason?: string | null
+  /** 额度口径与负债金额不一致（|amount_cny| != credit_used_cny）时的标记 */
+  credit_mismatch?: boolean | null
 }
 
 export interface SnapshotDetail {
@@ -173,6 +200,9 @@ export interface SaveItemPayload {
   fx_rate?: number | null
   note?: string | null
   auto_filled?: boolean
+  /** 信用卡额度：不传=不改，null=清回未观测 */
+  credit_limit_cny?: number | null
+  credit_available_cny?: number | null
 }
 
 export interface SaveSnapshotPayload {
@@ -195,6 +225,30 @@ export interface StructureResult {
   date: string
   groups: StructureGroup[]
   liabilities: StructureGroup[]
+}
+
+/** 信用卡额度指标（GET /api/metrics/credit）：不进净值，只做独立展示 */
+export interface CreditAccountRow {
+  account_id: number
+  name: string
+  limit: number | null
+  available: number | null
+  used: number | null
+  utilization: number | null
+  /** 与负债金额不一致（需人工复核，不阻塞） */
+  mismatch: boolean
+}
+
+export interface CreditMetrics {
+  date: string
+  total_limit: number
+  total_used: number
+  total_available: number
+  utilization: number | null
+  by_account: CreditAccountRow[]
+  /** 该期没有任何额度观测的信用卡账户 */
+  unrecorded_accounts: Array<{ account_id: number; name: string }>
+  absent_reason?: string | null
 }
 
 /** 逆地理编码结果 */

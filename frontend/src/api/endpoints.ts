@@ -3,6 +3,7 @@ import type {
   Account,
   AccountSeries,
   CarryForwardResult,
+  CreditMetrics,
   DiffResult,
   ExportBundle,
   FxResult,
@@ -158,6 +159,22 @@ export async function fetchLocationReverse(lat: number, lon: number, refresh = f
 /** 地点分布统计（只读小卡片，可选） */
 export async function fetchLocationMetrics(): Promise<LocationMetrics> {
   const { data } = await http.get<LocationMetrics>('/api/metrics/locations')
+  return data
+}
+
+/** 信用卡额度指标（GET /api/metrics/credit）：独立口径，不并入净值 */
+export async function fetchCreditMetrics(date?: string): Promise<CreditMetrics> {
+  const { data } = await http.get<CreditMetrics>('/api/metrics/credit', { params: date ? { date } : {} })
+  return data
+}
+
+/** 窄接口：只改某一账户的信用卡额度（不触碰明细金额与地点），body 可只带一个字段，null 表示清回未观测 */
+export async function updateSnapshotCredit(
+  date: string,
+  accountId: number,
+  payload: { credit_limit_cny?: number | null; credit_available_cny?: number | null },
+): Promise<SnapshotDetail> {
+  const { data } = await http.put<SnapshotDetail>(`/api/snapshots/${date}/credit/${accountId}`, payload)
   return data
 }
 

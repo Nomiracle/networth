@@ -6,7 +6,7 @@ import { addAlias, createAccount, fetchAccounts, updateAccount } from '@/api/end
 import type { Account } from '@/api/types'
 import { errorText } from '@/api/client'
 import { useSettingsStore } from '@/stores/settings'
-import { fmtMoney } from '@/utils/format'
+import { fmtMoney, fmtPct } from '@/utils/format'
 import { DEFAULT_TAXONOMY, confirmNewTaxonomy } from '@/utils/taxonomy'
 import CategoryPicker from '@/components/CategoryPicker.vue'
 
@@ -140,6 +140,26 @@ async function submitEdit(): Promise<void> {
 function openDetail(a: Account): void {
   void router.push({ name: 'account-detail', params: { id: String(a.id) } })
 }
+
+/** 信用卡额度：未观测或非信用卡账户一律显示 —，不插 0 */
+function creditLimitText(a: Account): string {
+  if (!a.is_credit_card) return '—'
+  if (a.credit_limit_cny == null) return '—'
+  return `¥${fmtMoney(a.credit_limit_cny)}`
+}
+function creditUsedText(a: Account): string {
+  if (!a.is_credit_card) return '—'
+  if (a.credit_used_cny == null) return '—'
+  return `¥${fmtMoney(a.credit_used_cny)}`
+}
+// 使用率阈值说明：≥80% 为常见的高使用率预警线（银行风控与征信评分常用 30%/50%/80% 分档，80% 以上显著提升风险提示；因此用 warn 色高亮）。
+// ≥95% 接近刷爆，进一步用 danger；低使用率不作特殊色，避免误导。
+function utilizationTagType(u: number | null | undefined): '' | 'warning' | 'danger' | 'success' {
+  if (u == null || Number.isNaN(u)) return ''
+  if (u >= 0.95) return 'danger'
+  if (u >= 0.8) return 'warning'
+  return ''
+}
 </script>
 
 <template>
@@ -185,6 +205,9 @@ function openDetail(a: Account): void {
               <th>最近日期</th>
               <th>期数</th>
               <th>别名</th>
+              <th>额度</th>
+              <th>已用</th>
+              <th>使用率</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -203,6 +226,12 @@ function openDetail(a: Account): void {
                 <span v-if="!(a.aliases ?? []).length">—</span>
                 <span v-else>{{ (a.aliases ?? []).slice(0, 2).join('、') }}<span v-if="(a.aliases ?? []).length > 2"> 等{{ (a.aliases ?? []).length }}个</span></span>
                 <el-button link type="primary" size="small" @click.stop="openAlias(a)">+别名</el-button>
+              </td>
+              <td class="muted">{{ creditLimitText(a) }}</td>
+              <td class="muted">{{ creditUsedText(a) }}</td>
+              <td>
+                <span v-if="!a.is_credit_card || a.credit_utilization == null">—</span>
+                <el-tag v-else :type="utilizationTagType(a.credit_utilization)" size="small" effect="plain">{{ fmtPct((a.credit_utilization ?? 0) * 100, 1) }}</el-tag>
               </td>
               <td>
                 <el-button link type="primary" size="small" data-testid="account-edit" @click.stop="openEdit(a)">编辑</el-button>
@@ -225,6 +254,15 @@ function openDetail(a: Account): void {
             <span v-if="a.last_date">{{ a.last_date }}</span>
             <span v-if="isStale(a)" class="tagline warn">已 {{ a.unchanged_tail }} 期未动</span>
             <el-button link type="primary" size="small" @click.stop="openEdit(a)">编辑</el-button>
+          </div>
+          <div v-if="a.is_credit_card" class="row2">
+            <span>额度 {{ creditLimitText(a) }}</span>
+            <span>已用 {{ creditUsedText(a) }}</span>
+            <span v-if="a.credit_utilization != null"><el-tag :type="utilizationTagType(a.credit_utilization)" size="small" effect="plain">使用率 {{ fmtPct((a.credit_utilization ?? 0) * 100, 1) }}</el-tag></span>
+            <span v-else>使用率 —</span>
+          </div>
+          <div v-else class="row2">
+            <span class="muted">信用卡额度 —</span>
           </div>
           <div v-if="(a.aliases ?? []).length > 1" class="row2">
             <span class="muted">别名：{{ (a.aliases ?? []).join('、') }}</span>

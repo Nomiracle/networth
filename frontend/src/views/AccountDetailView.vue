@@ -113,6 +113,111 @@ const logEntries = computed(() =>
     .reverse()
     .map((p) => ({ date: p.date, note: String(p.note), amount: p.amount, delta: p.delta })),
 )
+
+/** 信用卡：是否信用卡账户（由后端 is_credit_card 决定，subclass==信用卡或已有额度观测） */
+const isCreditCard = computed(() => !!acc.value?.is_credit_card)
+/** 是否有任何额度观测（只要有一个期有额度相关键且值非 null 即算有） */
+const hasCreditObservations = computed(() =>
+  points.value.some((p) => p.credit_limit_cny != null || p.credit_used_cny != null || p.credit_available_cny != null || p.credit_utilization != null),
+)
+
+/** 信用卡额度趋势图：未观测的期用 null 断开，绝不 connectNulls、绝不插 0；使用率用百分比轴 */
+const creditChartOption = computed<EChartsOption>(() => {
+  const list = points.value
+  // 未观测→键缺失→p.credit_* 为 undefined → 映射为 null 以断开折线；不要用 0 填充
+  const limits = list.map((p) => (p.credit_limit_cny != null ? p.credit_limit_cny : null))
+  const useds = list.map((p) => (p.credit_used_cny != null ? p.credit_used_cny : null))
+  const avails = list.map((p) => (p.credit_available_cny != null ? p.credit_available_cny : null))
+  // utilization 后端为 0-1 小数，图表用 0-100 百分比
+  const utils = list.map((p) => (p.credit_utilization != null ? Number(p.credit_utilization) * 100 : null))
+  return {
+    grid: { left: 4, right: 14, top: 24, bottom: 0, containLabel: true },
+    legend: {
+      top: 0,
+      left: 0,
+      itemWidth: 12,
+      itemHeight: 8,
+      textStyle: { fontSize: 11, color: '#5a6675' },
+      data: ['额度', '已用', '可用', '使用率'],
+    },
+    tooltip: {
+      trigger: 'axis',
+      confine: true,
+      formatter: (params: unknown) => {
+        const arr = Array.isArray(params) ? (params as any[]) : [(params as any)]
+        const idx = arr[0]?.dataIndex ?? 0
+        const date = list[idx]?.date ?? arr[0]?.axisValue ?? ''
+        const lines = [`<b>${date}</b>`]
+        for (const p of arr) {
+          const v = p.value
+          if (v == null) continue
+          if (p.seriesName === '使用率') lines.push(`${p.marker}${p.seriesName}：${Number(v).toFixed(1)}%`)
+          else lines.push(`${p.marker}${p.seriesName}：¥${fmtMoney(Number(v))}`)
+        }
+        if (lines.length === 1) lines.push('<span style="color:#8a94a6">该期未观测（已断开）</span>')
+        return lines.join('<br/>')
+      },
+    },
+    xAxis: {
+      type: 'category',
+      boundaryGap: false,
+      data: list.map((p) => shortDate(p.date)),
+      axisTick: { show: false },
+      axisLabel: { fontSize: 10, color: '#8a94a6', interval: Math.max(0, Math.floor(list.length / 6) - 1) },
+    },
+    yAxis: [
+      {
+        type: 'value',
+        scale: true,
+        axisLabel: { fontSize: 10, color: '#8a94a6', formatter: (v: number) => fmtCompact(v) },
+        splitLine: { lineStyle: { color: '#f1f4f8' } },
+      },
+      {
+        type: 'value',
+        min: 0,
+        max: 100,
+        axisLabel: { fontSize: 10, color: '#8a94a6', formatter: (v: number) => `${v}%` },
+        splitLine: { show: false },
+      },
+    ],
+    series: [
+      {
+        name: '额度',
+        type: 'line',
+        smooth: true,
+        symbol: 'none',
+        // 关键：未观测为 null 时断开，不设 connectNulls，不插 0
+        lineStyle: { width: 2.0, color: '#1f6feb' },
+        data: limits as unknown as number[],
+      },
+      {
+        name: '已用',
+        type: 'line',
+        smooth: true,
+        symbol: 'none',
+        lineStyle: { width: 2.0, color: '#e67e22' },
+        data: useds as unknown as number[],
+      },
+      {
+        name: '可用',
+        type: 'line',
+        smooth: true,
+        symbol: 'none',
+        lineStyle: { width: 1.4, color: '#6ec1a0', type: 'dashed' },
+        data: avails as unknown as number[],
+      },
+      {
+        name: '使用率',
+        type: 'line',
+        smooth: true,
+        symbol: 'none',
+        yAxisIndex: 1,
+        lineStyle: { width: 1.6, color: '#a855f7', type: 'dotted' },
+        data: utils as unknown as number[],
+      },
+    ],
+  }
+})
 </script>
 
 <template>
@@ -155,6 +260,20 @@ const logEntries = computed(() =>
           <span v-if="isStale" class="tagline warn">已 {{ acc.unchanged_tail }} 期未变动</span>
         </h2>
         <VChart :option="chartOption" height-class="chart-tall" :empty="points.length === 0" />
+      </div>
+
+      <!-- 信用卡额度趋势：仅信用卡账户展示；未观测期用 null 断开（不插0，不 connectNulls），使用率走右侧 0-100% 轴 -->
+      <div v-if="isCreditCard" class="card">
+        <h2 class="card-title">
+          信用卡额度趋势
+          <span class="spacer"></span>
+          <span class="hint">额度 / 已用 / 可用 + 使用率</span>
+        </h2>
+        <div v-if="!hasCreditObservations" class="empty">该信用卡账户暂无任何额度观测。去「录入」页为该账户填写额度与可用额度后，这里会显示额度/已用/使用率的趋势（未观测的期会断开，不会补 0）。</div>
+        <template v-else>
+          <VChart :option="creditChartOption" height-class="chart-tall" :empty="false" />
+          <div class="hint-line" style="margin-top: 6px">未观测的期已断开（显示为断层），不会用 0 填充；使用率在右侧百分比轴。</div>
+        </template>
       </div>
 
       <div class="card">

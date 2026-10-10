@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { fetchDiff, fetchLocationMetrics, fetchNetworth, fetchSnapshot, fetchSnapshots, fetchStructure } from '@/api/endpoints'
+import { fetchCreditMetrics, fetchDiff, fetchLocationMetrics, fetchNetworth, fetchSnapshot, fetchSnapshots, fetchStructure } from '@/api/endpoints'
 import type {
+  CreditMetrics,
   DiffResult,
   LocationMetrics,
   NetworthKpi,
@@ -34,6 +35,10 @@ const latestDate = ref('')
 const range = ref<'all' | '1y' | '3y'>('all')
 const showAllRows = ref(false)
 const locationMetrics = ref<LocationMetrics | null>(null)
+// 信用卡额度：独立口径，不并入净值/资产结构占比（硬口径：networth = Σ amount_cny）
+// 额度仅作风险提示，不进入资产合计/负债合计/占比计算，因此单独用 /api/metrics/credit 拉取并独立展示
+const creditMetrics = ref<CreditMetrics | null>(null)
+const creditLoading = ref(false)
 
 async function load(): Promise<void> {
   loading.value = true
@@ -55,6 +60,15 @@ async function load(): Promise<void> {
         .sort((a, b) => b.amount_cny - a.amount_cny)
         .slice(0, 10)
     }
+    // 信用卡独立口径：拉取最新一期的额度汇总（失败则保持未观测状态，不阻塞看板）
+    creditLoading.value = true
+    try {
+      creditMetrics.value = await fetchCreditMetrics(latestDate.value || undefined)
+    } catch {
+      creditMetrics.value = null
+    } finally {
+      creditLoading.value = false
+    }
   } catch (e) {
     errText.value = errorText(e)
   } finally {
@@ -69,6 +83,20 @@ onMounted(async () => {
     locationMetrics.value = await fetchLocationMetrics()
   } catch {
     /* 忽略，可选卡片 */
+  }
+})
+
+onMounted(async () => {
+  // 若 load 已请求过 credit，这里不再重复；否则兜底补一次（例如 load 因 networth 失败未走到 credit）
+  if (!creditMetrics.value && !creditLoading.value) {
+    creditLoading.value = true
+    try {
+      creditMetrics.value = await fetchCreditMetrics(latestDate.value || undefined)
+    } catch {
+      /* 未观测或后端未实现时保持空状态，模板显示文案而非 0 */
+    } finally {
+      creditLoading.value = false
+    }
   }
 })
 
@@ -471,6 +499,24 @@ function barShare(amount: number, kind: 'asset' | 'liability'): string {
   if (!total) return '—'
   return `${((Math.abs(amount) / total) * 100).toFixed(1)}%`
 }
+
+// 信用卡看板展示：有数据才算“已观测”，否则显示未观测文案而非 0
+const creditHasData = computed(() => {
+  const c = creditMetrics.value
+  if (!c) return false
+  // 后端 absent_reason 或空 by_account 且 total_limit 为 0 都视为无观测
+  if (c.absent_reason) return false
+  if (!c.by_account || c.by_account.length === 0) {
+    // 兼容后端未实现时 total_* 可能为 0，仍视为无数据
+    if ((c.total_limit ?? 0) === 0 && (c.total_used ?? 0) === 0) return false
+  }
+  return true
+})
+const creditUtilText = computed(() => {
+  const u = creditMetrics.value?.utilization
+  if (u == null) return '—'
+  return fmtPct(Number(u) * 100, 1)
+})
 </script>
 
 <template>
@@ -530,16 +576,58 @@ function barShare(amount: number, kind: 'asset' | 'liability'): string {
             <span>资产合计 <b>¥{{ fmtCompact(totalAssetTop) }}</b></span>
             <span>负债合计 <b>¥{{ fmtCompact(totalLiabTop) }}</b></span>
           </div>
+          <div class="hint-line" style="margin-top: 6px">不含信用卡额度（独立口径）</div>
         </div>
 
+        <!-- 信用卡：独立小块，不并入净值、不并入资产结构占比（硬口径：networth = Σ amount_cny，额度仅风控参考） -->
         <div class="card">
           <h2 class="card-title">
-            前 10 大持仓
+            信用卡
             <span class="spacer"></span>
-            <span class="hint">按金额（资产类）</span>
+            <span class="hint">{{ creditMetrics?.date || latestDate }}</span>
           </h2>
-          <VChart :option="holdingsOption" height-class="chart-mid" :empty="holdings.length === 0" />
+          <div v-if="creditLoading" class="hint-line">加载中…</div>
+          <div v-else-if="!creditHasData" class="empty" style="padding: 16px 0">
+            暂无信用卡额度观测。
+            <span v-if="creditMetrics?.absent_reason" class="muted">（{{ creditMetrics.absent_reason }}）</span>
+            <div class="hint-line" style="margin-top: 6px">去「录入」页为信用卡账户填写额度与剩余可用后，这里会汇总总额度 / 已用 / 可用与整体使用率（不进净值口径）。</div>
+          </div>
+          <template v-else>
+            <div class="kv">
+              <span class="k">总额度</span><span class="v">¥{{ fmtMoney(creditMetrics!.total_limit) }}</span>
+              <span class="k">已用</span><span class="v">¥{{ fmtMoney(creditMetrics!.total_used) }}</span>
+              <span class="k">剩余可用</span><span class="v">¥{{ fmtMoney(creditMetrics!.total_available) }}</span>
+              <span class="k">整体使用率</span><span class="v">{{ creditUtilText }}</span>
+              <span class="k">未观测账户</span><span class="v">{{ creditMetrics!.unrecorded_accounts.length }} 个</span>
+            </div>
+            <div v-if="creditMetrics!.by_account.length" class="tbl-scroll" style="margin-top: 10px">
+              <table class="nw">
+                <thead>
+                  <tr><th>账户</th><th>额度</th><th>已用</th><th>使用率</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in creditMetrics!.by_account" :key="row.account_id">
+                    <td>{{ row.name }}<span v-if="row.mismatch" class="tagline warn" style="margin-left: 6px">待核</span></td>
+                    <td>{{ row.limit == null ? '—' : `¥${fmtMoney(row.limit)}` }}</td>
+                    <td>{{ row.used == null ? '—' : `¥${fmtMoney(row.used)}` }}</td>
+                    <td>{{ row.utilization == null ? '—' : fmtPct(Number(row.utilization) * 100, 1) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-if="creditMetrics!.unrecorded_accounts.length" class="hint-line" style="margin-top: 6px">未观测：{{ creditMetrics!.unrecorded_accounts.map((a) => a.name).join('、') }}</div>
+            <div class="hint-line" style="margin-top: 6px">独立口径：不并入净值与资产结构占比，仅作额度风控参考。</div>
+          </template>
         </div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">
+          前 10 大持仓
+          <span class="spacer"></span>
+          <span class="hint">按金额（资产类）</span>
+        </h2>
+        <VChart :option="holdingsOption" height-class="chart-mid" :empty="holdings.length === 0" />
       </div>
 
       <div class="card">

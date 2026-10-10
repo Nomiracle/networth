@@ -222,6 +222,18 @@ READONLY_TOOLS: list[dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "credit_metrics",
+        "description": (
+            "信用卡额度指标：总额度 / 已用 / 剩余可用 / 使用率（GET /api/metrics/credit）。"
+            "注意：额度不参与净值，只做独立展示；未记录的期不会返回 0 而是给出原因码"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
 ]
 
 WRITE_TOOLS: list[dict[str, Any]] = [
@@ -450,6 +462,13 @@ def _call_readonly(name: str, args: dict[str, Any]) -> tuple[Any, bool, str | No
         return payload, False, None
     if name == "location_metrics":
         status, payload = _backend_request("GET", "/api/metrics/locations")
+        if status != 200:
+            return None, True, _tool_error_text(status, payload)
+        return payload, False, None
+    if name == "credit_metrics":
+        # 只读转发：额度写入一律走后端窄接口（PUT /api/snapshots/{date}/credit/{account_id}），
+        # MCP 侧不提供整期写入口，避免把「漏 items 的整期 PUT 会清空明细」这个坑暴露给模型
+        status, payload = _backend_request("GET", "/api/metrics/credit")
         if status != 200:
             return None, True, _tool_error_text(status, payload)
         return payload, False, None

@@ -34,6 +34,13 @@ interface MockItem {
   fx_rate: number | null
   note: string | null
   auto_filled: boolean
+  /** 信用卡额度（逐期观测）：未观测时键缺失 + credit_absent_reason，永不补 0 */
+  credit_limit_cny?: number | null
+  credit_available_cny?: number | null
+  credit_used_cny?: number | null
+  credit_utilization?: number | null
+  credit_absent_reason?: string | null
+  credit_mismatch?: boolean
 }
 
 interface MockSnapshot {
@@ -72,13 +79,44 @@ function syntheticLocationFor(date: string, idx: number): { location: { text: st
   return { location: { text: city, source: src, observed_at: src === 'device' ? new Date(`${date}T08:00:00Z`).toISOString() : null, lat: src === 'device' ? 39.9 + (hash%10)*0.01 : null, lon: src === 'device' ? 116.4 + (hash%10)*0.01 : null, accuracy_m: src === 'device' ? 25 : null }, reason: null }
 }
 
+/** 是否信用卡账户：子类为「信用卡」或名称含「信用卡」（与后端 is_credit_card 同口径） */
+function isCreditCardAccount(name: string, subclass?: string | null): boolean {
+  return (subclass ?? '') === '信用卡' || name.includes('信用卡')
+}
+
+/**
+ * 合成一套信用卡额度（演示数据用）：
+ * - 非信用卡账户：键缺失 + not_credit_card（未观测 ≠ 0）
+ * - 约 1/4 的期不记录 → 键缺失 + not_recorded，用来验证趋势断开与未观测渲染
+ * - 与负债金额差 > 1 元时给 credit_mismatch，页面应提示但不阻断提交
+ */
+function syntheticCreditFor(name: string, subclass: string | null | undefined, date: string, idx: number, amountCny: number): AnyRec {
+  if (!isCreditCardAccount(name, subclass)) return { credit_absent_reason: 'not_credit_card' }
+  const hash = [...name].reduce((a, c) => a + c.charCodeAt(0), 0)
+  if ((hash + idx) % 4 === 0) return { credit_absent_reason: 'not_recorded' }
+  const limit = 20000 + (hash % 6) * 10000
+  // 少数期只记了总额度（剩余额度未记录）：验证「只记一半也能看到已填的值」与派生列显示 —
+  if ((hash + idx) % 8 === 5) return { credit_limit_cny: limit, credit_absent_reason: 'not_recorded' }
+  const available = Math.round((limit * (0.25 + ((hash + idx * 7) % 6) / 10)) / 100) * 100
+  const used = Math.round((limit - available) * 100) / 100
+  return {
+    credit_limit_cny: limit,
+    credit_available_cny: available,
+    credit_used_cny: used,
+    credit_utilization: Math.round((used / limit) * 1000) / 1000,
+    credit_mismatch: Math.abs(Math.abs(amountCny) - used) > 1,
+  }
+}
+
 const REGISTERED_USERS: AnyRec[] = []
 
 function seed(): MockState {
   const rawSnaps = JSON.parse(JSON.stringify(fixtures.snapshots)) as MockSnapshot[]
   const withLoc = rawSnaps.map((s, idx) => {
     const { location, reason } = syntheticLocationFor(s.date, idx)
-    return { ...s, location, location_absent_reason: reason }
+    // 明细行同样补上信用卡额度（演示数据：部分期未记录，frontend 要能处理键缺失）
+    const items = s.items.map((it) => ({ ...it, ...syntheticCreditFor(it.account, it.subclass, s.date, idx, it.amount_cny) }))
+    return { ...s, items, location, location_absent_reason: reason }
   })
   return {
     version: 1,
@@ -244,6 +282,8 @@ function accountView(a: MockAccount, stats = accountStats(a.id)) {
     periods: stats.periods,
     unchanged_tail: stats.unchanged_tail,
     is_counted: a.is_counted ?? 1,
+    is_credit_card: isCreditCardAccount(a.name, a.subclass),
+    ...latestCreditFor(a.id),
   }
 }
 
@@ -485,7 +525,15 @@ const routes: Route[] = [
           const amount = item!.amount_cny
           const delta = prev === null ? null : round2(amount - prev)
           prev = amount
-          return { date: s.date, amount, delta }
+          // 未观测的期不给额度键：前端趋势必须断开而不是插 0
+          const credit: AnyRec = {}
+          if (typeof item!.credit_limit_cny === 'number') {
+            credit.credit_limit_cny = item!.credit_limit_cny
+            credit.credit_available_cny = item!.credit_available_cny
+            credit.credit_used_cny = item!.credit_used_cny
+            credit.credit_utilization = item!.credit_utilization
+          }
+          return { date: s.date, amount, delta, ...credit }
         })
       return { account: accountView(acc), points }
     },
@@ -592,6 +640,58 @@ const routes: Route[] = [
   },
   {
     method: 'GET',
+    pattern: /^\/api\/metrics\/credit$/,
+    handler: () => {
+      const snaps = [...state.snapshots].sort((a, b) => a.date.localeCompare(b.date))
+      const last = snaps[snaps.length - 1]
+      const rows: AnyRec[] = []
+      const unrecorded: AnyRec[] = []
+      let totalLimit = 0
+      let totalUsed = 0
+      let totalAvailable = 0
+      // 有账户只记了总额度时，整体使用率不编（返回 null）
+      let missingAvailable = false
+      for (const a of state.accounts) {
+        if (!isCreditCardAccount(a.name, a.subclass)) continue
+        const it = last ? last.items.find((x) => x.account_id === a.id) : undefined
+        const hasLimit = !!it && typeof it.credit_limit_cny === 'number'
+        const hasAvail = !!it && typeof it.credit_available_cny === 'number'
+        // 完全没观测才算 unrecorded；只记了一侧的仍要出现在 by_account（与后端同语义）
+        if (!hasLimit && !hasAvail) {
+          unrecorded.push({ account_id: a.id, name: a.name })
+          continue
+        }
+        const both = hasLimit && hasAvail
+        if (hasLimit) totalLimit += it!.credit_limit_cny as number
+        if (hasAvail) totalAvailable += it!.credit_available_cny as number
+        if (both) totalUsed += (it!.credit_used_cny as number) ?? 0
+        else missingAvailable = true
+        rows.push({
+          account_id: a.id,
+          name: a.name,
+          limit: hasLimit ? (it!.credit_limit_cny as number) : null,
+          available: hasAvail ? (it!.credit_available_cny as number) : null,
+          used: both ? (it!.credit_used_cny as number) ?? null : null,
+          utilization: both ? (it!.credit_utilization as number) ?? null : null,
+          mismatch: !!it!.credit_mismatch,
+        })
+      }
+      // 额度永不进净值：这里只做独立展示，不参与 networth / 资产结构口径
+      const out: AnyRec = {
+        date: last?.date ?? '',
+        total_limit: totalLimit,
+        total_used: Math.round(totalUsed * 100) / 100,
+        total_available: totalAvailable,
+        utilization: totalLimit > 0 && !missingAvailable ? Math.round((totalUsed / totalLimit) * 1000) / 1000 : null,
+        by_account: rows,
+        unrecorded_accounts: unrecorded,
+      }
+      if (rows.length === 0) out.absent_reason = 'not_recorded'
+      return out
+    },
+  },
+  {
+    method: 'GET',
     pattern: /^\/api\/metrics\/reconcile$/,
     handler: () => ({
       periods: (fixtures as AnyRec).reconcile,
@@ -606,6 +706,11 @@ const routes: Route[] = [
     method: 'PUT',
     pattern: /^\/api\/snapshots\/(\d{4}-\d{2}-\d{2})$/,
     handler: ({ body, config, m }) => upsertSnapshot(config, body, m[1]),
+  },
+  {
+    method: 'PUT',
+    pattern: /^\/api\/snapshots\/(\d{4}-\d{2}-\d{2})\/credit\/(\d+)$/,
+    handler: ({ body, config, m }) => setItemCredit(config, body, m[1], Number(m[2])),
   },
   {
     method: 'DELETE',
@@ -657,6 +762,77 @@ const routes: Route[] = [
   },
 ]
 
+/** 该校验/派生/打标逻辑必须与后端契约一致（docs/m1-spec.md §9）：limit>0、available>=0 */
+function applyCredit(item: MockItem, limit: number | null, available: number | null, config: InternalAxiosRequestConfig): void {
+  if (limit !== null && (!Number.isFinite(limit) || limit <= 0)) throw fail(config, 400, 'bad_credit_info', '总额度必须大于 0')
+  if (available !== null && (!Number.isFinite(available) || available < 0)) throw fail(config, 400, 'bad_credit_info', '剩余额度不能为负')
+  if (limit === null && available === null) {
+    // 清回未观测：键缺失 + 原因码，不写 0
+    delete item.credit_limit_cny
+    delete item.credit_available_cny
+    delete item.credit_used_cny
+    delete item.credit_utilization
+    item.credit_absent_reason = 'not_recorded'
+    return
+  }
+  item.credit_limit_cny = limit
+  item.credit_available_cny = available
+  if (limit !== null && available !== null) {
+    const used = round2(limit - available)
+    item.credit_used_cny = used
+    item.credit_utilization = Math.round((used / limit) * 1000) / 1000
+    // 口径不一致只打标，绝不改写负债金额
+    item.credit_mismatch = Math.abs(Math.abs(item.amount_cny) - used) > 1
+  } else {
+    delete item.credit_used_cny
+    delete item.credit_utilization
+    delete item.credit_mismatch
+  }
+  item.credit_absent_reason = null
+}
+
+/** 只改某一期某账户的额度观测（对齐后端 PUT /api/snapshots/{date}/credit/{account_id}） */
+function setItemCredit(config: InternalAxiosRequestConfig, body: AnyRec, date: string, accountId: number): AnyRec {
+  const snap = snapshotAt(date)
+  if (!snap) throw fail(config, 404, 'not_found', `无此期快照：${date}`)
+  const item = snap.items.find((i) => i.account_id === accountId)
+  if (!item) throw fail(config, 404, 'not_found', `该期没有账户 id=${accountId} 的明细`)
+  const limit = body.credit_limit_cny === undefined
+    ? (item.credit_limit_cny ?? null)
+    : (body.credit_limit_cny === null ? null : Number(body.credit_limit_cny))
+  const avail = body.credit_available_cny === undefined
+    ? (item.credit_available_cny ?? null)
+    : (body.credit_available_cny === null ? null : Number(body.credit_available_cny))
+  applyCredit(item, limit, avail, config)
+  persist()
+  return { account_id: item.account_id, ...creditOutOf(item) }
+}
+
+/** 取出该行现有的额度字段（未观测的键不出现） */
+function creditOutOf(item: MockItem): AnyRec {
+  const out: AnyRec = {}
+  if (typeof item.credit_limit_cny === 'number') out.credit_limit_cny = item.credit_limit_cny
+  if (typeof item.credit_available_cny === 'number') out.credit_available_cny = item.credit_available_cny
+  if (typeof item.credit_used_cny === 'number') out.credit_used_cny = item.credit_used_cny
+  if (typeof item.credit_utilization === 'number') out.credit_utilization = item.credit_utilization
+  if (item.credit_absent_reason) out.credit_absent_reason = item.credit_absent_reason
+  if (item.credit_mismatch) out.credit_mismatch = true
+  return out
+}
+
+/** 最近一期有额度观测的值（未观测的期跳过），用于账户列表/台账展示 */
+function latestCreditFor(accountId: number): AnyRec {
+  const snaps = [...state.snapshots].sort((a, b) => a.date.localeCompare(b.date))
+  for (let i = snaps.length - 1; i >= 0; i--) {
+    const it = snaps[i].items.find((x) => x.account_id === accountId)
+    // 只记了一侧也算「有观测」：回溯到最近一个有任何额度观测的期
+    if (it && (typeof it.credit_limit_cny === 'number' || typeof it.credit_available_cny === 'number')) {
+      return creditOutOf(it)
+    }
+  }
+  return {}
+}
+
 function upsertSnapshot(config: InternalAxiosRequestConfig, body: AnyRec, date: string): AnyRec {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) throw fail(config, 400, 'invalid_payload', '日期格式必须为 YYYY-MM-DD')
   const rawItems = (body.items as AnyRec[]) || []
@@ -664,7 +840,7 @@ function upsertSnapshot(config: InternalAxiosRequestConfig, body: AnyRec, date: 
   const items: MockItem[] = rawItems.map((raw) => {
     const acc = accountById(Number(raw.account_id))
     if (!acc) throw fail(config, 400, 'invalid_payload', `未知账户 id=${raw.account_id}`)
-    return {
+    const item: MockItem = {
       account_id: acc.id,
       account: acc.name,
       kind: acc.kind,
@@ -676,6 +852,19 @@ function upsertSnapshot(config: InternalAxiosRequestConfig, body: AnyRec, date: 
       note: raw.note ?? null,
       auto_filled: !!raw.auto_filled,
     }
+    // 额度：数据里显式带才改（undefined = 不改，null = 清回未观测），与后端语义一致
+    if (raw.credit_limit_cny === undefined && raw.credit_available_cny === undefined) {
+      item.credit_absent_reason = isCreditCardAccount(acc.name, acc.subclass) ? 'not_recorded' : 'not_credit_card'
+    } else {
+      const limit = raw.credit_limit_cny === undefined
+        ? (item.credit_limit_cny ?? null)
+        : (raw.credit_limit_cny === null ? null : Number(raw.credit_limit_cny))
+      const avail = raw.credit_available_cny === undefined
+        ? (item.credit_available_cny ?? null)
+        : (raw.credit_available_cny === null ? null : Number(raw.credit_available_cny))
+      applyCredit(item, limit, avail, config)
+    }
+    return item
   })
   // 地点校验：source 白名单，device 必须带 lat/lon，parsed_note 拒绝
   if (body.location !== undefined && body.location !== null) {

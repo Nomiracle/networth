@@ -215,8 +215,8 @@ class McpProtocolTests(unittest.TestCase):
             self.assertIn("save_snapshot", names)
             self.assertIn("patch_account", names)
             self.assertIn("set_location", names)
-            # 总数 16
-            self.assertEqual(len(resp["result"]["tools"]), 16)
+            # 总数 17（新增 credit_metrics）
+            self.assertEqual(len(resp["result"]["tools"]), 17)
             for tool in resp["result"]["tools"]:
                 schema = tool["inputSchema"]
                 self.assertEqual(schema.get("type"), "object")

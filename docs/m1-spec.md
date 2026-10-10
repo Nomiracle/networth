@@ -138,3 +138,16 @@ networth/
 - **逆地理**：`GET /api/location/reverse?lat=&lon=[&refresh=1]`（需登录），provider 由 `NETWORTH_GEOCODE_PROVIDER` 决定（`off`(默认)|`nominatim`|`amap`），`off→409 provider_disabled`，`amap` 无 `NETWORTH_AMAP_KEY→409 provider_not_configured`，抓取失败→502 `geocode_failed` 且绝不编造；坐标出网前按约 1km 网格粗化（`lat_key/lon_key` 保留 2 位小数），命中缓存直接返回 `cached:true` 且不重复出网；`nominatim` 带 `User-Agent` 且限速 ≤1 次/秒。解析结果必须落到**城市级**（去掉末尾的「市」，否则 provider 的写法与用户手填会在 `metrics/locations` 里裂成两组）。
 - **指标**：`GET /api/metrics/locations → {groups:[{text,periods,first_date,last_date,networth_change,stays:[{from,to,periods}]}], unrecorded_periods}`，`stays` 为同一地点连续区间，未观测期仅计入 `unrecorded_periods`。
 - **回填**：`python3 -m app.location_backfill [--db PATH] [--apply]` 默认 dry-run；从 `snapshot_item.note` 解析 `地点[:：]文本`，同期多账户同值记一条、不同值冲突不写、只填 `location_text IS NULL` 的期、写入 `source=parsed_note` 且不改 `note` 一个字符、幂等。
+
+## 9. 信用卡额度（总额度 / 剩余额度）
+
+- **对象**：`snapshot_item` 新增 `credit_limit_cny REAL NULL`（总额度）与 `credit_available_cny REAL NULL`（剩余可用额度）。两者都是**逐期观测值**，**各自独立判定**：未观测的那一项值为 NULL、API 返回该键缺失，**绝不补 0**。只记了一半（例如只填了总额度）时，已记的那一项照常返回，同时给 `credit_absent_reason="not_recorded"` 说明还有未记录的部分；两侧都没有才用 `credit_absent_reason` 区分 `not_recorded`（信用卡未记录）/ `not_credit_card`（非信用卡账户）。迁移幂等（`PRAGMA table_info` + `ALTER TABLE ADD COLUMN`），`meta.schema_version=3`。
+- **派生**：`credit_used_cny = credit_limit_cny - credit_available_cny`；`credit_utilization = used / limit`（两者都在才有派生值；只在服务端算，不落库）。
+- **不变量**：额度字段**永不参与净值**（`networth = Σ amount_cny` 不变）；`amount_cny` 仍是唯一权威金额，`|amount_cny| ≠ credit_used_cny` 只打 `credit_mismatch` 标记待复核，不阻塞提交、不覆盖金额。
+- **校验**：`limit > 0`、`available >= 0`，非法 → 400 `bad_credit_info`；`available > limit`（溢缴款/多还款）合法但打 `credit_overpaid`。
+- **读写**：整期 `POST/PUT /api/snapshots/{date}` 的 items 可带这两个字段；**窄接口** `PUT /api/snapshots/{date}/credit/{account_id}` 只改额度（body 可只带一个字段，`null` 表示清回未观测），返回该行最新派生值。整期 upsert 是「删明细 + 重插」，因此任何只带额度的写入必须走窄接口（整期漏 `items` 仍 400 `partial_update_unsupported`）。
+- **自动带入**：`carry-forward` 带出上期两个值并标 `auto_filled=1`；**永不覆盖手改过的值**（沿用 `upsert_snapshot` 的既有语义）。
+- **指标**：`GET /api/metrics/credit → {date, total_limit, total_used, total_available, utilization, by_account:[{account_id,name,limit,available,used,utilization,mismatch}], unrecorded_accounts:[...], absent_reason?}`。看板可展示，但**不并入资产结构占比**。
+- **适用账户**：`subclass == '信用卡'`，或该行已有额度观测值（避免子类改名后数据变孤儿）；外币卡按当期 `fx_rate` 折算为 CNY。
+- **历史**：不回填历史期（原表无此信息），从用户录入的那一期起才有值；趋势图对未观测期断开，不插 0。
+- **导入导出**：`/api/import` 与 M0 JSON 的两个字段均为可选，缺省 NULL，向后兼容（版本号不变）。

@@ -10,6 +10,7 @@ import {
   fetchFxRate,
   fetchSnapshot,
   saveSnapshot,
+  updateSnapshotCredit,
 } from '@/api/endpoints'
 import type { Account, CarryForwardResult, DiffResult, FxResult, SaveItemPayload, SaveSnapshotPayload, SnapshotDetail } from '@/api/types'
 import { errorText, isApiError } from '@/api/client'
@@ -42,6 +43,14 @@ interface EditRow {
   auto_filled: boolean
   added: boolean
   removed: boolean
+  /** 信用卡额度：字符串输入，空=未观测（不传或 null） */
+  credit_limit: string
+  credit_available: string
+  orig_credit_limit: number | null
+  orig_credit_available: number | null
+  /** 后端返回的不一致标记与未观测原因 */
+  credit_mismatch: boolean | null
+  credit_absent_reason: string | null
 }
 
 const DRAFT_KEY = 'networth_snapshot_draft'
@@ -169,6 +178,133 @@ function deltaOf(r: EditRow): number | null {
   return Math.round((v - r.baseline) * 100) / 100
 }
 
+/* --------------------------- 信用卡额度：解析与派生 --------------------------- */
+function parseCredit(s: string): number | null {
+  if (s === null || s === undefined) return null
+  const t = String(s).trim()
+  if (t === '') return null
+  // 复用与金额相同的清洗（去逗号、货币符号），允许小数两位
+  const cleaned = t.replace(/[\s,，¥￥]/g, '').replace(/[。．]/g, '.').replace(/[－—−]/g, '-')
+  const n = Number(cleaned)
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : Number.NaN
+}
+
+function creditLimitOf(r: EditRow): number | null {
+  const v = parseCredit(r.credit_limit)
+  return v === null || Number.isNaN(v) ? v : v
+}
+
+function creditAvailableOf(r: EditRow): number | null {
+  const v = parseCredit(r.credit_available)
+  return v === null || Number.isNaN(v) ? v : v
+}
+
+function creditUsedOf(r: EditRow): number | null {
+  const lim = creditLimitOf(r)
+  const avail = creditAvailableOf(r)
+  if (lim === null || avail === null || Number.isNaN(lim) || Number.isNaN(avail)) return null
+  return Math.round((lim - avail) * 100) / 100
+}
+
+function creditUtilOf(r: EditRow): number | null {
+  const lim = creditLimitOf(r)
+  const used = creditUsedOf(r)
+  if (lim === null || used === null || Number.isNaN(lim) || Number.isNaN(used) || lim === 0) return null
+  return used / lim
+}
+
+const accountMap = computed(() => {
+  const m = new Map<number, Account>()
+  for (const a of accounts.value) m.set(a.id, a)
+  return m
+})
+
+function isCreditRow(r: EditRow): boolean {
+  if (r.kind !== 'liability') return false
+  const acc = accountMap.value.get(r.account_id)
+  if (acc?.is_credit_card) return true
+  // subclass 回退（兼容 is_credit_card 未及时刷新的情况）
+  if (acc?.subclass === '信用卡' || r.subclass === '信用卡') return true
+  // 已有额度观测值（结转带出或后端历史）
+  if (r.orig_credit_limit !== null || r.orig_credit_available !== null) return true
+  if (r.credit_limit.trim() !== '' || r.credit_available.trim() !== '') return true
+  return false
+}
+
+function isCreditInvalid(r: EditRow): boolean {
+  if (!isCreditRow(r) || r.removed) return false
+  const lim = parseCredit(r.credit_limit)
+  const avail = parseCredit(r.credit_available)
+  if (Number.isNaN(lim) || Number.isNaN(avail)) return true
+  if (lim !== null && lim < 0) return true
+  if (avail !== null && avail < 0) return true
+  return false
+}
+
+function creditMismatchOf(r: EditRow): { mismatch: boolean; diff: number | null } {
+  const used = creditUsedOf(r)
+  const amt = amountOf(r)
+  if (used === null || amt === null || Number.isNaN(used) || Number.isNaN(amt)) return { mismatch: false, diff: null }
+  const diff = Math.abs(Math.abs(amt) - used)
+  const localMismatch = diff > 1 + 1e-9
+  const backendMismatch = !!r.credit_mismatch
+  return { mismatch: localMismatch || backendMismatch, diff: localMismatch ? Math.round(diff * 100) / 100 : diff }
+}
+
+function onCreditInput(r: EditRow): void {
+  if (r.auto_filled) r.auto_filled = false
+}
+
+const creditSaving = ref<Record<number, boolean>>({})
+
+async function saveCreditRow(r: EditRow): Promise<void> {
+  if (!isCreditRow(r)) return
+  if (isCreditInvalid(r)) {
+    ElMessage.warning('额度为空可不填，已填必须为非负数（最多两位小数）')
+    return
+  }
+  const lim = parseCredit(r.credit_limit)
+  const avail = parseCredit(r.credit_available)
+  // 至少填一个
+  if (lim === null && avail === null) {
+    ElMessage.warning('总额度与剩余额度至少填一个（都为空将清空该行额度）')
+    // 仍允许清空：显式发 null
+  }
+  if (mode.value !== 'edit') {
+    ElMessage.warning('仅已保存的期次可单独保存额度；新期请直接“提交本期快照”一并保存')
+    return
+  }
+  creditSaving.value = { ...creditSaving.value, [r.account_id]: true }
+  try {
+    const payload: { credit_limit_cny?: number | null; credit_available_cny?: number | null } = {}
+    // 空字符串 => null（清空），否则数字
+    payload.credit_limit_cny = r.credit_limit.trim() === '' ? null : (lim as number)
+    payload.credit_available_cny = r.credit_available.trim() === '' ? null : (avail as number)
+    // 若两列都为空，仍发送两个 null 以清空
+    const res = await updateSnapshotCredit(formDate.value, r.account_id, payload)
+    // 后端返回 SnapshotDetail，刷新该行派生值
+    const updated = (res as SnapshotDetail).items?.find((it) => it.account_id === r.account_id)
+    if (updated) {
+      r.orig_credit_limit = typeof updated.credit_limit_cny === 'number' ? updated.credit_limit_cny : null
+      r.orig_credit_available = typeof updated.credit_available_cny === 'number' ? updated.credit_available_cny : null
+      r.credit_limit = typeof updated.credit_limit_cny === 'number' ? String(updated.credit_limit_cny) : ''
+      r.credit_available = typeof updated.credit_available_cny === 'number' ? String(updated.credit_available_cny) : ''
+      r.credit_mismatch = (updated as unknown as { credit_mismatch?: boolean | null }).credit_mismatch ?? null
+      r.credit_absent_reason = (updated as unknown as { credit_absent_reason?: string | null }).credit_absent_reason ?? null
+    } else {
+      // 回退：按本地提交值更新 orig
+      r.orig_credit_limit = payload.credit_limit_cny ?? null
+      r.orig_credit_available = payload.credit_available_cny ?? null
+      r.credit_mismatch = null
+    }
+    ElMessage.success(`额度已保存：${r.account}`)
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    creditSaving.value = { ...creditSaving.value, [r.account_id]: false }
+  }
+}
+
 /* --------------------------- 汇总 --------------------------- */
 const totals = computed(() => {
   let assets = 0
@@ -222,7 +358,7 @@ const invalidRows = computed(() => rows.value.filter((r) => isRowInvalid(r)))
 function fingerprint(): string {
   const body = rows.value
     .filter((r) => !r.removed)
-    .map((r) => `${r.account_id}:${r.ccy}:${r.amount}:${r.usd}:${r.note}`)
+    .map((r) => `${r.account_id}:${r.ccy}:${r.amount}:${r.usd}:${r.note}:${r.credit_limit}:${r.credit_available}`)
     .join('|')
   const loc = `${locationText.value}|${locationSource.value}|${locationLat.value}|${locationLon.value}`
   return `${formDate.value}|${fxRate.value}|${marketNote.value}|${loc}|${status.value}|${body}`
@@ -288,7 +424,7 @@ function toggleGroup(name: string): void {
 }
 
 /* --------------------------- 数据装载 --------------------------- */
-function applyItems(items: { account_id: number; account: string; kind: 'asset' | 'liability'; category?: string | null; subclass?: string | null; amount_cny: number; amount_usd?: number | null; fx_rate?: number | null; note?: string | null; auto_filled?: number | boolean | null }[]): EditRow[] {
+function applyItems(items: { account_id: number; account: string; kind: 'asset' | 'liability'; category?: string | null; subclass?: string | null; amount_cny: number; amount_usd?: number | null; fx_rate?: number | null; note?: string | null; auto_filled?: number | boolean | null; credit_limit_cny?: number | null; credit_available_cny?: number | null; credit_used_cny?: number | null; credit_utilization?: number | null; credit_mismatch?: boolean | null; credit_absent_reason?: string | null }[]): EditRow[] {
   return items.map((i) => {
     const cny = typeof i.amount_cny === 'number' ? i.amount_cny : null
     const usd = typeof i.amount_usd === 'number' ? i.amount_usd : null
@@ -315,6 +451,12 @@ function applyItems(items: { account_id: number; account: string; kind: 'asset' 
       auto_filled: !!i.auto_filled,
       added: false,
       removed: false,
+      credit_limit: typeof i.credit_limit_cny === 'number' ? String(i.credit_limit_cny) : '',
+      credit_available: typeof i.credit_available_cny === 'number' ? String(i.credit_available_cny) : '',
+      orig_credit_limit: typeof i.credit_limit_cny === 'number' ? i.credit_limit_cny : null,
+      orig_credit_available: typeof i.credit_available_cny === 'number' ? i.credit_available_cny : null,
+      credit_mismatch: typeof i.credit_mismatch === 'boolean' ? i.credit_mismatch : null,
+      credit_absent_reason: typeof i.credit_absent_reason === 'string' ? i.credit_absent_reason : null,
     }
   })
 }
@@ -708,6 +850,12 @@ async function onAddAccount(): Promise<void> {
       auto_filled: false,
       added: true,
       removed: false,
+      credit_limit: '',
+      credit_available: '',
+      orig_credit_limit: null,
+      orig_credit_available: null,
+      credit_mismatch: null,
+      credit_absent_reason: null,
     })
     addVisible.value = false
     addForm.value = { account_id: null, name: '', kind: 'asset', ...DEFAULT_TAXONOMY.asset, amount: '' }
@@ -731,7 +879,7 @@ function buildPayload(sv: 'draft' | 'final'): SaveSnapshotPayload {
       // 人民币行：未手动切换过币种时保留原有的美元标记与行级汇率，避免保存即抹掉原表信息
       const usd = isUsd ? usdOf(r) : (r.ccy_touched ? null : r.orig_usd)
       const fx = isUsd ? fxNum.value : (r.orig_fx ?? fxNum.value)
-      return {
+      const base: SaveItemPayload = {
         account_id: r.account_id,
         amount_cny: amountOf(r) ?? 0,
         amount_usd: usd,
@@ -739,6 +887,24 @@ function buildPayload(sv: 'draft' | 'final'): SaveSnapshotPayload {
         note: r.note || null,
         auto_filled: r.auto_filled && !isChanged(r),
       }
+      // 信用卡额度：仅对可显示额度的负债行随整期一起提交（空=未填）
+      if (isCreditRow(r)) {
+        const lim = parseCredit(r.credit_limit)
+        const avail = parseCredit(r.credit_available)
+        // 非法时交由 isCreditInvalid 阻断提交前校验；这里按契约发送 null 或数值
+        if (r.credit_limit.trim() === '' && r.credit_available.trim() === '') {
+          // 都为空：显式用 null 清空（不传=不改，但整期是全量重建，传 null 更明确）
+          base.credit_limit_cny = null
+          base.credit_available_cny = null
+        } else {
+          base.credit_limit_cny = Number.isNaN(lim) ? null : lim
+          base.credit_available_cny = Number.isNaN(avail) ? null : avail
+          // 单列为空时用 null 表示“清回未观测”，另一列有值
+          if (r.credit_limit.trim() === '') base.credit_limit_cny = null
+          if (r.credit_available.trim() === '') base.credit_available_cny = null
+        }
+      }
+      return base
     })
   const trimmedLoc = locationText.value.trim()
   const payload: SaveSnapshotPayload = {
@@ -1072,6 +1238,50 @@ const hasPrev = computed(() => mode.value === 'edit' || savedFingerprint.value !
                     ≈ ¥{{ fmtMoney(amountOf(r) ?? 0) }}<span v-if="fxNum"> @ {{ fxNum }}</span>
                   </div>
                 </div>
+                <div v-if="isCreditRow(r)" class="credit-wrap">
+                  <div class="credit-inputs">
+                    <el-input
+                      :model-value="r.credit_limit"
+                      size="small"
+                      inputmode="decimal"
+                      :class="{ 'is-invalid': isCreditInvalid(r) }"
+                      placeholder="总额度"
+                      :data-testid="`snapshot-credit-limit-${r.account_id}`"
+                      @update:model-value="(v: string) => { r.credit_limit = v; onCreditInput(r) }"
+                    >
+                      <template #prefix>总额度 ¥</template>
+                    </el-input>
+                    <el-input
+                      :model-value="r.credit_available"
+                      size="small"
+                      inputmode="decimal"
+                      :class="{ 'is-invalid': isCreditInvalid(r) }"
+                      placeholder="剩余额度"
+                      :data-testid="`snapshot-credit-available-${r.account_id}`"
+                      @update:model-value="(v: string) => { r.credit_available = v; onCreditInput(r) }"
+                    >
+                      <template #prefix>剩余额度 ¥</template>
+                    </el-input>
+                  </div>
+                  <div class="credit-derived">
+                    <span class="credit-derived-item">已用 {{ creditUsedOf(r) !== null ? '¥' + fmtMoney(creditUsedOf(r) as number) : '—' }}</span>
+                    <span class="credit-derived-item">使用率 {{ creditUtilOf(r) !== null ? fmtPct((creditUtilOf(r) as number) * 100, 1) : '—' }}</span>
+                  </div>
+                  <div
+                    v-if="creditMismatchOf(r).mismatch"
+                    class="credit-warn"
+                    :data-testid="`snapshot-credit-mismatch-${r.account_id}`"
+                  >
+                    与负债金额差 {{ fmtMoney(creditMismatchOf(r).diff as number) }} 元，可继续提交
+                  </div>
+                  <el-button
+                    size="small"
+                    :loading="!!creditSaving[r.account_id]"
+                    :data-testid="`snapshot-credit-save-${r.account_id}`"
+                    @click="saveCreditRow(r)"
+                    >仅保存额度</el-button
+                  >
+                </div>
                 <el-button link size="small" type="danger" @click="removeRow(r)">
                   {{ r.removed ? '撤销' : '移除' }}
                 </el-button>
@@ -1202,5 +1412,66 @@ const hasPrev = computed(() => mode.value === 'edit' || savedFingerprint.value !
 }
 .fx-note.warn {
   color: #d97706;
+}
+.credit-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.credit-inputs {
+  display: flex;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.credit-inputs .el-input {
+  width: 140px;
+}
+.credit-derived {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  color: #8a94a6;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.credit-derived-item {
+  white-space: nowrap;
+}
+.credit-warn {
+  font-size: 11px;
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  padding: 2px 7px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+@media (max-width: 560px) {
+  .snap-row {
+    flex-wrap: wrap;
+  }
+  .snap-row .credit-wrap {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+  .snap-row .credit-wrap .credit-inputs {
+    flex: 1 1 100%;
+    width: 100%;
+    display: flex;
+    flex-direction: row;
+    gap: 6px;
+  }
+  .snap-row .credit-wrap .credit-inputs .el-input {
+    flex: 1 1 0;
+    width: auto;
+    min-width: 0;
+  }
+  .snap-row .credit-derived {
+    flex: 1 1 100%;
+  }
 }
 </style>

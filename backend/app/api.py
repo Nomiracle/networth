@@ -268,6 +268,20 @@ def h_metrics_locations(ctx: RequestContext) -> tuple[int, Any]:
     return 200, domain.location_metrics(ctx.store)
 
 
+def h_metrics_credit(ctx: RequestContext) -> tuple[int, Any]:
+    ctx.user()
+    return 200, domain.credit_metrics(ctx.store)
+
+
+def h_snapshot_credit_set(ctx: RequestContext) -> tuple[int, Any]:
+    """PUT /api/snapshots/{date}/credit/{account_id}：只改额度，绝不触碰明细。"""
+    ctx.user()
+    body = ctx.require_body()
+    account_id = int(ctx.params["account_id"])
+    result = domain.set_snapshot_credit(ctx.store, ctx.params["date"], account_id, body)
+    return 200, result
+
+
 def h_metrics_networth(ctx: RequestContext) -> tuple[int, Any]:
     ctx.user()
     return 200, domain.networth_metrics(ctx.store)
@@ -311,9 +325,10 @@ ROUTES: list[tuple[str, re.Pattern[str], Callable[[RequestContext], tuple[int, A
     ("POST", re.compile(r"^/api/snapshots/?$"), h_snapshot_create, True),
     ("GET", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/diff/?$"), h_snapshot_diff, True),
     ("GET", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/?$"), h_snapshot_get, True),
-    # 地点窄接口必须先于整期 PUT（同一路径前缀，顺序敏感）
+    # 地点/额度窄接口必须先于整期 PUT（同一路径前缀，顺序敏感）
     ("PUT", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/location/?$"), h_snapshot_location_set, True),
     ("POST", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/location/?$"), h_snapshot_location_set, True),
+    ("PUT", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/credit/(?P<account_id>\d+)/?$"), h_snapshot_credit_set, True),
     ("PUT", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/?$"), h_snapshot_put, True),
     ("DELETE", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/?$"), h_snapshot_delete, True),
     ("GET", re.compile(r"^/api/metrics/networth/?$"), h_metrics_networth, True),
@@ -321,6 +336,7 @@ ROUTES: list[tuple[str, re.Pattern[str], Callable[[RequestContext], tuple[int, A
     ("GET", re.compile(r"^/api/metrics/structure/?$"), h_metrics_structure, True),
     ("GET", re.compile(r"^/api/metrics/reconcile/?$"), h_metrics_reconcile, True),
     ("GET", re.compile(r"^/api/metrics/locations/?$"), h_metrics_locations, True),
+    ("GET", re.compile(r"^/api/metrics/credit/?$"), h_metrics_credit, True),
     ("GET", re.compile(r"^/api/location/reverse/?$"), h_location_reverse, True),
     ("GET", re.compile(r"^/api/export/?$"), h_export, True),
     ("POST", re.compile(r"^/api/import/?$"), h_import, True),

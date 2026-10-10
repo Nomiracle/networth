@@ -249,7 +249,7 @@ class LocationTests(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertEqual(row["snapshot_date"], "2020-01-01")
             # schema_version
-            self.assertEqual(store.get_meta("schema_version"), "2")
+            self.assertEqual(store.get_meta("schema_version"), "3")
             store.close()
             # 第二次 init（幂等）
             store2 = Store(db)
@@ -258,7 +258,7 @@ class LocationTests(unittest.TestCase):
                 self.assertIn(col, cols2)
             row2 = store2.get_snapshot("2020-01-01")
             self.assertIsNotNone(row2)
-            self.assertEqual(store2.get_meta("schema_version"), "2")
+            self.assertEqual(store2.get_meta("schema_version"), "3")
             # geocode_cache 存在
             tbl = store2.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='geocode_cache'").fetchone()
             self.assertIsNotNone(tbl)

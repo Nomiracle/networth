@@ -32,6 +32,124 @@ LOCATION_VALID_SOURCES = {"manual", "carried", "device", "parsed_note"}
 LOCATION_API_ALLOWED = {"manual", "carried", "device"}  # parsed_note 只允许 CLI
 LOCATION_ABSENT_REASON = "not_recorded"
 
+# 信用卡额度相关常量
+CREDIT_ABSENT_NOT_CREDIT = "not_credit_card"
+CREDIT_ABSENT_NOT_RECORDED = "not_recorded"
+
+
+def _is_credit_card_account(account_row: sqlite3.Row | dict[str, Any] | None, observed_ids: set[int] | None = None) -> bool:
+    """判断账户是否属于信用卡：subclass=='信用卡' 或 已有额度观测值。"""
+    if account_row is None:
+        return False
+    try:
+        subclass = account_row["subclass"]  # type: ignore[index]
+    except Exception:
+        subclass = None
+    if subclass == "信用卡":
+        return True
+    if observed_ids is not None:
+        try:
+            aid = int(account_row["id"])  # type: ignore[index]
+        except Exception:
+            try:
+                aid = int(account_row["account_id"])  # type: ignore[index]
+            except Exception:
+                return False
+        return aid in observed_ids
+    return False
+
+
+def _credit_absent_reason(account_row: sqlite3.Row | dict[str, Any] | None, observed_ids: set[int] | None) -> str:
+    """未观测时的原因码：非信用卡 vs 信用卡但未记录。"""
+    if _is_credit_card_account(account_row, observed_ids):
+        return CREDIT_ABSENT_NOT_RECORDED
+    return CREDIT_ABSENT_NOT_CREDIT
+
+
+def _validate_credit(limit: float | None, available: float | None) -> None:
+    """校验额度合法性；非法抛 bad_credit_info。"""
+    if limit is not None:
+        if not isinstance(limit, (int, float)) or limit != limit:  # NaN check
+            raise DomainError(400, "bad_credit_info", "credit_limit_cny 非法")
+        if limit <= 0:
+            raise DomainError(400, "bad_credit_info", "credit_limit_cny 必须 > 0")
+    if available is not None:
+        if not isinstance(available, (int, float)) or available != available:
+            raise DomainError(400, "bad_credit_info", "credit_available_cny 非法")
+        if available < 0:
+            raise DomainError(400, "bad_credit_info", "credit_available_cny 不能为负")
+
+
+def _credit_derived(limit: float | None, available: float | None) -> tuple[float | None, float | None]:
+    """派生：used = limit - available；utilization = used / limit（两者都在才有）。"""
+    if limit is None or available is None:
+        return None, None
+    used = float(limit) - float(available)
+    util = used / float(limit) if float(limit) != 0 else None
+    return r2(used), util
+
+
+def _opt_credit(value: Any, idx: int, field: str) -> float | None:
+    """可选的额度字段：None/''/null → None；非法 → 400 bad_credit_info。"""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise DomainError(400, "bad_credit_info", f"items[{idx}].{field} 非法") from exc
+
+
+def _serialize_credit_for_item(item_row: sqlite3.Row | dict[str, Any],
+                                account_row: sqlite3.Row | dict[str, Any] | None,
+                                observed_ids: set[int] | None) -> dict[str, Any]:
+    """为单个明细行序列化额度字段（键缺失语义 + 派生 + 标记）。"""
+    # 兼容 Row 与 dict，limit/available 可能为 None 或缺键
+    def _get(key: str) -> Any:
+        try:
+            return item_row[key]  # type: ignore[index]
+        except Exception:
+            return None
+    raw_limit = _get("credit_limit_cny")
+    # 也兼容 account_series 的别名？但 store 统一用 credit_limit_cny
+    # 处理历史数据缺列时可能为 None
+    limit = float(raw_limit) if raw_limit is not None else None
+    raw_avail = _get("credit_available_cny")
+    available = float(raw_avail) if raw_avail is not None else None
+    # amount 用于 mismatch 判断
+    try:
+        amount = float(item_row["amount_cny"])  # type: ignore[index]
+    except Exception:
+        amount = None
+    flags_raw = _get("flags")
+    flags = _flags_of(flags_raw)
+    out: dict[str, Any] = {}
+    # 两个额度各自独立判定：用户很可能先只填总额度，那时不能把整行当成未观测
+    # （否则保存后回读看不到刚填的值——实测过的坑）
+    if limit is not None:
+        out["credit_limit_cny"] = r2(limit)
+    if available is not None:
+        out["credit_available_cny"] = r2(available)
+    if limit is not None and available is not None:
+        used, util = _credit_derived(limit, available)
+        out["credit_used_cny"] = used
+        out["credit_utilization"] = util
+        # 溢缴款：available > limit → flags 加 credit_overpaid（派生，不落库）
+        if available > limit:
+            if "credit_overpaid" not in flags:
+                flags = flags + ["credit_overpaid"]
+        # mismatch：|amount| != used
+        if amount is not None and used is not None:
+            if abs(abs(amount) - used) > MONEY_EPS:
+                out["credit_mismatch"] = True
+    elif limit is None and available is None:
+        out["credit_absent_reason"] = _credit_absent_reason(account_row, observed_ids)
+    else:
+        # 只记了一半：已记的那一项照常返回，同时如实说明还有未记录的部分
+        # （前端派生列会显示 —，而不是把已填的值吞掉）
+        out["credit_absent_reason"] = CREDIT_ABSENT_NOT_RECORDED
+    out["flags"] = flags
+    return out
+
 
 def _location_from_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any] | None:
     """从 snapshot 行提取 location 对象；无记录时返回 None。"""
@@ -345,11 +463,40 @@ def account_views(store: Store) -> list[dict[str, Any]]:
     """GET /api/accounts 的数据。"""
     aliases = store.aliases_by_account()
     summaries = store.account_summaries()
+    observed_ids = store.credit_observed_accounts()
+    # 最新一期的额度：取每个账户最后一次出现的明细里的 credit 值
+    # 为避免 N+1，使用一次查询批量取最新额度？
+    # 简单起见，对每个账户取其最新一点的 credit（store.account_series 已有序）
+    # 但为性能，这里直接用一条 SQL 聚合：取每个账户最新快照的 credit
+    # 回退方案：逐账户查最后一点（账户数少，开销可接受）
+    latest_credit: dict[int, dict[str, Any]] = {}
+    for row in store.list_accounts():
+        aid = int(row["id"])
+        # 从最新一期往前找「有任一额度观测」的期：最后一期常常是未观测的，
+        # 若只看 series[-1]，台账/详情就会错误地显示成没有额度
+        for pt in reversed(store.account_series(aid)):
+            lim = pt.get("credit_limit_cny")
+            avail = pt.get("credit_available_cny")
+            if lim is None and avail is None:
+                continue
+            entry_credit: dict[str, Any] = {}
+            if lim is not None:
+                entry_credit["credit_limit_cny"] = r2(lim)
+            if avail is not None:
+                entry_credit["credit_available_cny"] = r2(avail)
+            # 派生值要求两者都在
+            if lim is not None and avail is not None:
+                used, util = _credit_derived(float(lim), float(avail))
+                entry_credit["credit_used_cny"] = used
+                entry_credit["credit_utilization"] = util
+            latest_credit[aid] = entry_credit
+            break
     out = []
     for row in store.list_accounts():
         aid = int(row["id"])
         info = summaries.get(aid, {})
-        out.append({
+        is_cc = _is_credit_card_account(row, observed_ids)
+        entry: dict[str, Any] = {
             "id": aid,
             "name": row["name"],
             "category": row["category"],
@@ -367,7 +514,12 @@ def account_views(store: Store) -> list[dict[str, Any]]:
             "last_date": info.get("last_date"),
             "periods": int(info.get("periods") or 0),
             "unchanged_tail": int(info.get("unchanged_tail") or 0),
-        })
+            "is_credit_card": is_cc,
+        }
+        # 最新额度：有观测时才给键，否则键缺失（前端断开趋势）
+        if aid in latest_credit:
+            entry.update(latest_credit[aid])
+        out.append(entry)
     return out
 
 
@@ -379,18 +531,34 @@ def account_series(store: Store, account_id: int) -> dict[str, Any]:
     # 与 /api/accounts 保持同一套账户字段：否则前端详情页的「期数 / 计入统计 /
     # 未变动期数」会读成空值（曾实测显示「期数 0、计入统计 否」）
     info = store.account_summaries().get(account_id, {})
+    is_cc = _is_credit_card_account(row, store.credit_observed_accounts())
     points = []
     prev: float | None = None
     for item in store.account_series(account_id):
         amount = r2(item["amount"])
-        points.append({
+        pt: dict[str, Any] = {
             "date": item["date"],
             "amount": amount,
             "delta": None if prev is None else r2((amount or 0.0) - prev),
             "amount_usd": item["amount_usd"],
             "fx_rate": r6(item["fx_rate"]),
             "note": item["note"],
-        })
+        }
+        # 额度：未观测的那一项不给键（前端趋势断开而不是插 0）；已观测的照常给
+        lim = item.get("credit_limit_cny")
+        avail = item.get("credit_available_cny")
+        if lim is not None:
+            pt["credit_limit_cny"] = r2(lim)
+        if avail is not None:
+            pt["credit_available_cny"] = r2(avail)
+        if lim is not None and avail is not None:
+            used, util = _credit_derived(float(lim), float(avail))
+            pt["credit_used_cny"] = used
+            pt["credit_utilization"] = util
+            if amount is not None and used is not None:
+                if abs(abs(amount) - used) > MONEY_EPS:
+                    pt["credit_mismatch"] = True
+        points.append(pt)
         prev = amount or 0.0
     return {
         "account": {
@@ -404,6 +572,7 @@ def account_series(store: Store, account_id: int) -> dict[str, Any]:
             "last_date": info.get("last_date"),
             "periods": int(info.get("periods") or 0),
             "unchanged_tail": int(info.get("unchanged_tail") or 0),
+            "is_credit_card": is_cc,
         },
         "points": points,
     }
@@ -552,10 +721,17 @@ def snapshot_detail(store: Store, date_text: str) -> dict[str, Any]:
     if snap is None:
         raise DomainError(404, "not_found", f"快照不存在：{date_text}")
     totals = store.get_snapshot_totals(date_text) or {}
+    observed_ids = store.credit_observed_accounts()
+    # 为 credit_absent_reason 判断准备账户行映射
+    acct_map: dict[int, sqlite3.Row] = {int(r["id"]): r for r in store.list_accounts()}
     items = []
     for item in store.items_of(int(snap["id"])):
         flags = _flags_of(item["flags"])
-        items.append({
+        # 基础额度派生与标记
+        cred = _serialize_credit_for_item(item, acct_map.get(int(item["account_id"])), observed_ids)
+        # 合并 flags（credit_overpaid 已在内部处理）
+        flags = cred.pop("flags")
+        entry: dict[str, Any] = {
             "account_id": int(item["account_id"]),
             "account": item["account_name"],
             "kind": item["kind"],
@@ -567,7 +743,12 @@ def snapshot_detail(store: Store, date_text: str) -> dict[str, Any]:
             "note": item["note"],
             "auto_filled": int(item["auto_filled"] or 0),
             "flags": flags,
-        })
+        }
+        # 额度字段：键缺失语义由 _serialize_credit_for_item 决定
+        for k in ("credit_limit_cny", "credit_available_cny", "credit_used_cny", "credit_utilization", "credit_absent_reason", "credit_mismatch"):
+            if k in cred:
+                entry[k] = cred[k]
+        items.append(entry)
     snapshot = {
         "date": snap["snapshot_date"],
         "status": snap["status"] or "final",
@@ -615,8 +796,13 @@ def carry_forward(store: Store, from_date: str | None = None) -> dict[str, Any]:
     snap = store.get_snapshot(date_text)
     items = []
     if snap is not None:
+        observed_ids = store.credit_observed_accounts()
+        acct_map = {int(r["id"]): r for r in store.list_accounts()}
         for item in store.items_of(int(snap["id"])):
-            items.append({
+            cred = _serialize_credit_for_item(item, acct_map.get(int(item["account_id"])), observed_ids)
+            # carry-forward 带出上期两个值（把上期的值填进结转行，标 auto_filled=1）
+            # 只带原始额度，未观测则不带键（由 _serialize_credit_for_item 决定）
+            base = {
                 "account_id": int(item["account_id"]),
                 "account": item["account_name"],
                 "kind": item["kind"],
@@ -627,7 +813,15 @@ def carry_forward(store: Store, from_date: str | None = None) -> dict[str, Any]:
                 "fx_rate": r6(item["fx_rate"]),
                 "note": item["note"],
                 "auto_filled": 1,
-            })
+                "flags": cred.get("flags", _flags_of(item["flags"])),
+            }
+            for k in ("credit_limit_cny", "credit_available_cny", "credit_used_cny", "credit_utilization", "credit_absent_reason", "credit_mismatch"):
+                if k in cred:
+                    # 对结转，派生与标记仍可展示，但 absent_reason 也要保留
+                    base[k] = cred[k]
+            # 若上期有额度观测，保留额度字段；否则保持键缺失
+            # 已包含在上面循环
+            items.append(base)
     fx_default = snap["default_fx_rate"] if snap is not None else None
     if fx_default is None:
         rates = [i["fx_rate"] for i in items if i["fx_rate"] is not None]
@@ -704,6 +898,84 @@ def set_snapshot_location(store: Store, date_text: str, location: Any) -> dict[s
     return snapshot_detail(store, date_text)
 
 
+def set_snapshot_credit(store: Store, date_text: str, account_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    """PUT /api/snapshots/{date}/credit/{account_id}：只改额度的窄接口，绝不触碰其它明细。
+
+    为什么需要窄接口：save_snapshot 是整期全量 upsert（delete+insert），任何只带额度的写入
+    必须走此窄接口，否则会被误判为 partial_update_unsupported 或静默清空明细。
+    payload 可只带一个字段（credit_limit_cny / credit_available_cny），null 表示清回未观测。
+    返回该行的最新派生值（与 items[] 里同一形状）。
+    """
+    date_text = normalize_date(date_text)
+    snap = store.get_snapshot(date_text)
+    if snap is None:
+        raise DomainError(404, "not_found", f"快照不存在：{date_text}")
+    # 检查账户是否在该期明细里
+    # 账户不在该期明细里 → 404（理由：该期的明细集合是权威范围，额度是明细行的附属观测值，
+    # 不允许为不存在的行凭空创建额度观测；避免静默扩大期明细集合）
+    existing = None
+    for it in store.items_of(int(snap["id"])):
+        if int(it["account_id"]) == int(account_id):
+            existing = it
+            break
+    if existing is None:
+        raise DomainError(404, "not_found", f"账户 {account_id} 不在该期明细中")
+    # 校验 body：可只带一个字段，null 表示清回未观测；缺键表示保留原值
+    has_limit = "credit_limit_cny" in payload
+    has_avail = "credit_available_cny" in payload
+    if not has_limit and not has_avail:
+        raise DomainError(400, "bad_credit_info", "至少提供 credit_limit_cny 或 credit_available_cny 之一")
+    # 现有值
+    cur_limit = existing["credit_limit_cny"] if "credit_limit_cny" in existing.keys() else None
+    # Row 的 keys 包含列，但值可能为 None；上述判断不够严谨，直接取值
+    try:
+        cur_limit = existing["credit_limit_cny"]
+    except Exception:
+        cur_limit = None
+    try:
+        cur_avail = existing["credit_available_cny"]
+    except Exception:
+        cur_avail = None
+    # 新值：若键缺失则保留原值，若值为 null 则清回未观测
+    new_limit: float | None
+    new_avail: float | None
+    if has_limit:
+        v = payload.get("credit_limit_cny")
+        if v is None:
+            new_limit = None
+        else:
+            try:
+                new_limit = float(v)
+            except (TypeError, ValueError) as exc:
+                raise DomainError(400, "bad_credit_info", "credit_limit_cny 非法") from exc
+    else:
+        new_limit = float(cur_limit) if cur_limit is not None else None
+    if has_avail:
+        v = payload.get("credit_available_cny")
+        if v is None:
+            new_avail = None
+        else:
+            try:
+                new_avail = float(v)
+            except (TypeError, ValueError) as exc:
+                raise DomainError(400, "bad_credit_info", "credit_available_cny 非法") from exc
+    else:
+        new_avail = float(cur_avail) if cur_avail is not None else None
+    # 校验
+    _validate_credit(new_limit, new_avail)
+    # 只有两者都为 None 时是完全清回未观测；否则若仅一个为 None 则保留另一侧的单字段观测？
+    # 但派生要求两者都在才有派生值，所以单字段保留是合法的（另一字段为 null 视为未观测）
+    # 更新
+    store.update_snapshot_item_credit(int(snap["id"]), int(account_id), new_limit, new_avail)
+    # 回读该行最新派生值（与 items[] 同形状）
+    detail = snapshot_detail(store, date_text)
+    for it in detail["items"]:
+        if int(it["account_id"]) == int(account_id):
+            return it
+    # 理论上不会到这里
+    raise DomainError(404, "not_found", f"账户 {account_id} 不在该期明细中")
+
+
 def save_snapshot(store: Store, payload: dict[str, Any], date_from_path: str | None = None) -> dict[str, Any]:
     """POST /api/snapshots 与 PUT /api/snapshots/{date} 共用的 upsert。"""
     date_raw = payload.get("date") or date_from_path
@@ -766,6 +1038,10 @@ def save_snapshot(store: Store, payload: dict[str, Any], date_from_path: str | N
                 amount = float(raw_cny)
             except (TypeError, ValueError) as exc:
                 raise DomainError(400, "bad_request", f"items[{idx}].amount_cny 非法") from exc
+        # 信用卡额度：可选，缺省 NULL（未观测），非法 → bad_credit_info
+        credit_limit = _opt_credit(raw.get("credit_limit_cny"), idx, "credit_limit_cny")
+        credit_avail = _opt_credit(raw.get("credit_available_cny"), idx, "credit_available_cny")
+        _validate_credit(credit_limit, credit_avail)
         items.append({
             "account_id": account_id,
             "amount_cny": amount,
@@ -774,6 +1050,8 @@ def save_snapshot(store: Store, payload: dict[str, Any], date_from_path: str | N
             "note": raw.get("note"),
             "auto_filled": 1 if raw.get("auto_filled") else 0,
             "flags": raw.get("flags"),
+            "credit_limit_cny": credit_limit,
+            "credit_available_cny": credit_avail,
         })
 
     status = str(payload.get("status") or "final")
@@ -1171,6 +1449,107 @@ def location_metrics(store: Store) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- 导入导出
 
+def credit_metrics(store: Store) -> dict[str, Any]:
+    """GET /api/metrics/credit：信用卡额度汇总（最新一期，永不计入净值）。"""
+    snaps = store.snapshot_totals()
+    if not snaps:
+        return {"date": None, "total_limit": 0, "total_used": 0, "total_available": 0,
+                "utilization": None, "by_account": [], "unrecorded_accounts": [],
+                "absent_reason": "not_recorded"}
+    latest_date = str(snaps[-1]["date"])
+    snap = store.get_snapshot(latest_date)
+    if snap is None:
+        return {"date": latest_date, "total_limit": 0, "total_used": 0, "total_available": 0,
+                "utilization": None, "by_account": [], "unrecorded_accounts": [],
+                "absent_reason": "not_recorded"}
+    observed_ids = store.credit_observed_accounts()
+    credit_accounts = []
+    for row in store.list_accounts():
+        if _is_credit_card_account(row, observed_ids):
+            credit_accounts.append(row)
+    by_account: list[dict[str, Any]] = []
+    unrecorded: list[dict[str, Any]] = []
+    total_limit = 0.0
+    total_used = 0.0
+    total_available = 0.0
+    has_recorded = False
+    # 有账户只记了总额度（缺剩余额度）时，整体使用率不能编：置 null 而非按不完整数据算
+    missing_available = False
+    for acc_row in credit_accounts:
+        aid = int(acc_row["id"])
+        item_row = None
+        for it in store.items_of(int(snap["id"])):
+            if int(it["account_id"]) == aid:
+                item_row = it
+                break
+        if item_row is None:
+            unrecorded.append({"account_id": aid, "name": acc_row["name"]})
+            continue
+        lim = item_row["credit_limit_cny"]
+        avail = item_row["credit_available_cny"]
+        try:
+            lim_f = float(lim) if lim is not None else None
+        except Exception:
+            lim_f = None
+        try:
+            avail_f = float(avail) if avail is not None else None
+        except Exception:
+            avail_f = None
+        # 完全没观测的信用卡账户才算 unrecorded；只记了一侧的仍要出现在 by_account 里
+        if lim_f is None and avail_f is None:
+            unrecorded.append({"account_id": aid, "name": acc_row["name"]})
+            continue
+        # 只要有任何一侧观测，就进 by_account（只填了总额度也要能看到），
+        # 缺的那一侧按未观测返回 null，派生值只在两侧都有时才给
+        used: float | None = None
+        util: float | None = None
+        if lim_f is not None and avail_f is not None:
+            used, util = _credit_derived(lim_f, avail_f)
+        mismatch = False
+        if used is not None:
+            try:
+                amt = float(item_row["amount_cny"])
+            except Exception:
+                amt = None
+            if amt is not None and abs(abs(amt) - used) > MONEY_EPS:
+                mismatch = True
+        by_account.append({
+            "account_id": aid,
+            "name": acc_row["name"],
+            "limit": r2(lim_f) if lim_f is not None else None,
+            "available": r2(avail_f) if avail_f is not None else None,
+            "used": used,
+            "utilization": util,
+            "mismatch": mismatch,
+        })
+        if lim_f is not None:
+            total_limit += float(lim_f)
+        if avail_f is not None:
+            total_available += float(avail_f)
+        if used is not None:
+            total_used += float(used)
+        else:
+            # 有账户缺少「剩余额度」→ 总额/已用不完整，整体使用率不能编
+            missing_available = True
+        has_recorded = True
+    by_account.sort(key=lambda x: -(x["used"] or 0))
+    utilization = None
+    if total_limit != 0 and not missing_available:
+        utilization = total_used / total_limit
+    result: dict[str, Any] = {
+        "date": latest_date,
+        "total_limit": r2(total_limit),
+        "total_used": r2(total_used),
+        "total_available": r2(total_available),
+        "utilization": utilization,
+        "by_account": by_account,
+        "unrecorded_accounts": unrecorded,
+    }
+    if not has_recorded:
+        result["absent_reason"] = "not_recorded"
+    return result
+
+
 def export_payload(store: Store) -> dict[str, Any]:
     """GET /api/export。"""
     aliases = store.aliases_by_account()
@@ -1198,7 +1577,7 @@ def export_payload(store: Store) -> dict[str, Any]:
         sid = int(row["id"])
         items = []
         for item in store.items_of(sid):
-            items.append({
+            entry: dict[str, Any] = {
                 "account_id": int(item["account_id"]),
                 "account": item["account_name"],
                 "kind": item["kind"],
@@ -1208,7 +1587,14 @@ def export_payload(store: Store) -> dict[str, Any]:
                 "note": item["note"],
                 "auto_filled": int(item["auto_filled"] or 0),
                 "flags": _flags_of(item["flags"]),
-            })
+            }
+            try:
+                entry["credit_limit_cny"] = r2(item["credit_limit_cny"]) if item["credit_limit_cny"] is not None else None
+                entry["credit_available_cny"] = r2(item["credit_available_cny"]) if item["credit_available_cny"] is not None else None
+            except Exception:
+                entry["credit_limit_cny"] = None
+                entry["credit_available_cny"] = None
+            items.append(entry)
         snapshots.append({
             "date": row["snapshot_date"],
             "status": row["status"] or "final",
@@ -1293,6 +1679,17 @@ def import_payload(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
                 raise DomainError(400, "bad_request",
                                   f"快照 {date_text} 存在未知账户：{raw.get('account') or raw.get('account_id')}")
             flags = _flags_of(raw.get("flags")) if raw.get("flags") else None
+            cl = raw.get("credit_limit_cny")
+            ca = raw.get("credit_available_cny")
+            try:
+                cl_f = float(cl) if cl is not None and cl != "" else None
+            except (TypeError, ValueError) as exc:
+                raise DomainError(400, "bad_credit_info", f"导入 credit_limit_cny 非法：{cl!r}") from exc
+            try:
+                ca_f = float(ca) if ca is not None and ca != "" else None
+            except (TypeError, ValueError) as exc:
+                raise DomainError(400, "bad_credit_info", f"导入 credit_available_cny 非法：{ca!r}") from exc
+            _validate_credit(cl_f, ca_f)
             items.append({
                 "account_id": account_id,
                 "amount_cny": float(raw.get("amount_cny") or 0.0),
@@ -1301,6 +1698,8 @@ def import_payload(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
                 "note": raw.get("note"),
                 "auto_filled": 1 if raw.get("auto_filled") else 0,
                 "flags": _json_text(flags),
+                "credit_limit_cny": cl_f,
+                "credit_available_cny": ca_f,
             })
         ts = now_iso()
         loc = snap.get("location")
