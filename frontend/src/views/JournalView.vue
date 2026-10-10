@@ -9,8 +9,8 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { fetchAccounts, fetchJournal } from '@/api/endpoints'
-import type { Account, JournalEntry, JournalResult } from '@/api/types'
+import { fetchAccounts, fetchJournal, fetchSnapshots } from '@/api/endpoints'
+import type { Account, JournalEntry, JournalResult, SnapshotSummary } from '@/api/types'
 import { errorText } from '@/api/client'
 import { fmtMoney } from '@/utils/format'
 
@@ -24,6 +24,30 @@ const scope = ref<'all' | 'journal' | 'account'>('all')
 const keyword = ref('')
 const accountId = ref<number | undefined>(undefined)
 const expanded = ref<Set<string>>(new Set())
+const snapshots = ref<SnapshotSummary[]>([])
+const snapshotMap = computed<Record<string, SnapshotSummary>>(() => {
+  const m: Record<string, SnapshotSummary> = {}
+  for (const s of snapshots.value) m[s.date] = s
+  return m
+})
+function locationOf(date: string): string {
+  const s = snapshotMap.value[date]
+  if (!s) return ''
+  if (s.location && s.location.text) return s.location.text
+  return ''
+}
+function locationAbsentOf(date: string): string {
+  const s = snapshotMap.value[date]
+  if (!s) return ''
+  if (s.location && s.location.text) return ''
+  return s.location_absent_reason || '未记录'
+}
+function locationSourceOf(date: string): string {
+  const s = snapshotMap.value[date]
+  const src = s?.location?.source
+  const m: Record<string, string> = { manual: '手动', carried: '沿用', device: '定位', parsed_note: '备注解析' }
+  return src ? (m[src] ?? src) : ''
+}
 
 const entries = computed<JournalEntry[]>(() => data.value?.entries ?? [])
 
@@ -65,6 +89,11 @@ onMounted(async () => {
     accounts.value = await fetchAccounts()
   } catch {
     /* 账户列表失败不影响日志浏览 */
+  }
+  try {
+    snapshots.value = await fetchSnapshots()
+  } catch {
+    /* 地点信息缺失不影响日志 */
   }
 })
 
@@ -151,6 +180,8 @@ function reset(): void {
             <span class="muted">¥{{ fmtMoney(e.accounts[0]?.amount_cny ?? 0) }}</span>
           </span>
           <span class="spacer"></span>
+          <span v-if="locationOf(e.date)" class="emeta"><b>{{ locationOf(e.date) }}</b><span v-if="locationSourceOf(e.date)" class="tagline blue" style="margin-left: 4px">{{ locationSourceOf(e.date) }}</span></span>
+          <span v-else class="emeta muted">地点：{{ locationAbsentOf(e.date) || '未记录' }}</span>
           <el-button link type="primary" size="small" @click="openPeriod(e.date)">查看该期 ▸</el-button>
         </div>
 

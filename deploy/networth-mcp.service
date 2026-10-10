@@ -1,0 +1,28 @@
+[Unit]
+Description=networth MCP (净值管家) - stdlib MCP 桥接
+Documentation=file://<PROJECT_ROOT>/mcp/README.md
+After=network-online.target networth-api.service
+Wants=network-online.target
+Requires=networth-api.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=<PROJECT_ROOT>
+EnvironmentFile=-<PROJECT_ROOT>/backend/.env
+# 注意：不要在这里再用空值 Environment= 覆盖 EnvironmentFile 里的同名变量——systemd 后出现的
+# Environment= 会盖掉 .env 的值，NETWORTH_MCP_TOKEN 被清空后 MCP 调后端一律 401。
+Environment=NETWORTH_API_BASE=http://127.0.0.1:8972
+Environment=NETWORTH_MCP_ALLOW_WRITE=1
+Environment=NETWORTH_MCP_BIND=127.0.0.1
+Environment=NETWORTH_MCP_PORT=18084
+ExecStart=/usr/bin/python3 -m mcp.server --http --bind 127.0.0.1 --port 18084
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/networth-mcp.log
+StandardError=append:/var/log/networth-mcp.log
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

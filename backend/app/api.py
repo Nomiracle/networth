@@ -215,6 +215,23 @@ def h_snapshot_create(ctx: RequestContext) -> tuple[int, Any]:
     return 200, domain.save_snapshot(ctx.store, ctx.require_body())
 
 
+def h_snapshot_location_set(ctx: RequestContext) -> tuple[int, Any]:
+    """PUT/POST /api/snapshots/{date}/location：只改地点（明细一字不动）。
+
+    两种 body 形态都接受：{"location": {...}|null} 或直接平铺 {text, source, ...}。
+    location 为 null 表示清空（回到「未观测」，响应里 location 键缺失 + location_absent_reason）。
+    """
+    body = ctx.require_body()
+    if "location" in body:
+        loc = body.get("location")
+    else:
+        loc = {k: body.get(k) for k in ("text", "source", "observed_at", "lat", "lon", "accuracy_m")
+               if k in body}
+        if not loc:
+            raise DomainError(400, "bad_location", "缺少 location（或 text/source 等字段）")
+    return 200, domain.set_snapshot_location(ctx.store, ctx.params["date"], loc)
+
+
 def h_snapshot_put(ctx: RequestContext) -> tuple[int, Any]:
     ctx.user()
     return 200, domain.save_snapshot(ctx.store, ctx.require_body(), date_from_path=ctx.params["date"])
@@ -234,6 +251,21 @@ def h_fx(ctx: RequestContext) -> tuple[int, Any]:
     ctx.user()
     refresh = str(ctx.q("refresh") or "").lower() in {"1", "true", "yes"}
     return 200, domain.fx_lookup(ctx.store, ctx.q("date"), refresh=refresh)
+
+
+def h_location_reverse(ctx: RequestContext) -> tuple[int, Any]:
+    ctx.user()
+    lat = ctx.q("lat")
+    lon = ctx.q("lon")
+    if lat is None or lon is None:
+        raise DomainError(400, "bad_location", "缺少 lat/lon 参数")
+    refresh = str(ctx.q("refresh") or "").lower() in {"1", "true", "yes"}
+    return 200, domain.location_reverse(ctx.store, lat, lon, refresh=refresh)
+
+
+def h_metrics_locations(ctx: RequestContext) -> tuple[int, Any]:
+    ctx.user()
+    return 200, domain.location_metrics(ctx.store)
 
 
 def h_metrics_networth(ctx: RequestContext) -> tuple[int, Any]:
@@ -279,12 +311,17 @@ ROUTES: list[tuple[str, re.Pattern[str], Callable[[RequestContext], tuple[int, A
     ("POST", re.compile(r"^/api/snapshots/?$"), h_snapshot_create, True),
     ("GET", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/diff/?$"), h_snapshot_diff, True),
     ("GET", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/?$"), h_snapshot_get, True),
+    # 地点窄接口必须先于整期 PUT（同一路径前缀，顺序敏感）
+    ("PUT", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/location/?$"), h_snapshot_location_set, True),
+    ("POST", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/location/?$"), h_snapshot_location_set, True),
     ("PUT", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/?$"), h_snapshot_put, True),
     ("DELETE", re.compile(r"^/api/snapshots/(?P<date>[\d\-/]+)/?$"), h_snapshot_delete, True),
     ("GET", re.compile(r"^/api/metrics/networth/?$"), h_metrics_networth, True),
     ("GET", re.compile(r"^/api/journal/?$"), h_journal, True),
     ("GET", re.compile(r"^/api/metrics/structure/?$"), h_metrics_structure, True),
     ("GET", re.compile(r"^/api/metrics/reconcile/?$"), h_metrics_reconcile, True),
+    ("GET", re.compile(r"^/api/metrics/locations/?$"), h_metrics_locations, True),
+    ("GET", re.compile(r"^/api/location/reverse/?$"), h_location_reverse, True),
     ("GET", re.compile(r"^/api/export/?$"), h_export, True),
     ("POST", re.compile(r"^/api/import/?$"), h_import, True),
 ]

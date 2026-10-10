@@ -113,6 +113,16 @@ CREATE INDEX IF NOT EXISTS snapshot_date_idx ON snapshot(snapshot_date);
 CREATE INDEX IF NOT EXISTS token_user_idx ON token(user_id);
 CREATE INDEX IF NOT EXISTS account_alias_account_idx ON account_alias(account_id);
 CREATE INDEX IF NOT EXISTS event_date_idx ON event(event_date);
+CREATE TABLE IF NOT EXISTS geocode_cache (
+  id INTEGER PRIMARY KEY,
+  provider TEXT NOT NULL,
+  lat_key TEXT NOT NULL,
+  lon_key TEXT NOT NULL,
+  text TEXT,
+  fetched_at TEXT NOT NULL,
+  raw TEXT,
+  UNIQUE(provider, lat_key, lon_key)
+);
 """
 
 # 账户表可更新字段白名单（PATCH /api/accounts/{id}）
@@ -148,6 +158,34 @@ class Store:
         """幂等建表 + 迁移。"""
         with self._lock:
             self.conn.executescript(SCHEMA)
+            # 幂等迁移：为已存在的 snapshot 表补充 location 列（老库无这些列）
+            try:
+                cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(snapshot)").fetchall()}
+            except sqlite3.Error:
+                cols = set()
+            expected = {
+                "location_text": "TEXT",
+                "location_source": "TEXT",
+                "location_observed_at": "TEXT",
+                "location_lat": "REAL",
+                "location_lon": "REAL",
+                "location_accuracy_m": "REAL",
+            }
+            for col, typ in expected.items():
+                if col not in cols:
+                    try:
+                        self.conn.execute(f"ALTER TABLE snapshot ADD COLUMN {col} {typ}")
+                    except sqlite3.Error:
+                        pass  # 并发或已存在时忽略，幂等
+            # 记录 schema 版本（幂等）
+            try:
+                self.conn.execute(
+                    "INSERT INTO meta(key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("schema_version", "2"),
+                )
+            except sqlite3.Error:
+                pass
             self.conn.commit()
 
     @contextmanager
@@ -480,6 +518,13 @@ class Store:
         created_at: str | None = None,
         updated_at: str | None = None,
         keep_created_at: bool = True,
+        location_text: str | None = None,
+        location_source: str | None = None,
+        location_observed_at: str | None = None,
+        location_lat: float | None = None,
+        location_lon: float | None = None,
+        location_accuracy_m: float | None = None,
+        _location_provided: bool = False,
     ) -> tuple[int, bool]:
         """按 date 幂等 upsert 一期快照；明细行整期 delete + insert。返回 (id, created)。"""
         flags_text = _json.dumps(flags or [], ensure_ascii=False) if flags is not None else None
@@ -490,23 +535,44 @@ class Store:
             if created:
                 cur = conn.execute(
                     """INSERT INTO snapshot(snapshot_date, status, default_fx_rate, market_note,
-                                            data_quality_flags, source, created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?)""",
+                                            data_quality_flags, source, created_at, updated_at,
+                                            location_text, location_source, location_observed_at,
+                                            location_lat, location_lon, location_accuracy_m)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (date, status, default_fx_rate, market_note, flags_text, source,
-                     created_at or updated_at, updated_at),
+                     created_at or updated_at, updated_at,
+                     location_text, location_source, location_observed_at,
+                     location_lat, location_lon, location_accuracy_m),
                 )
                 snapshot_id = int(cur.lastrowid or 0)
             else:
                 snapshot_id = int(row["id"])
-                conn.execute(
-                    """UPDATE snapshot SET status=?, default_fx_rate=?, market_note=?, data_quality_flags=?,
-                                          source=?, created_at=?, updated_at=? WHERE id=?""",
-                    (status, default_fx_rate, market_note,
-                     flags_text if flags is not None else row["data_quality_flags"],
-                     source or row["source"],
-                     (row["created_at"] if keep_created_at else created_at) or created_at,
-                     updated_at, snapshot_id),
-                )
+                # 地点：只有显式提供时才覆盖（自动带入永不覆盖已手动改过的值）
+                if _location_provided:
+                    conn.execute(
+                        """UPDATE snapshot SET status=?, default_fx_rate=?, market_note=?, data_quality_flags=?,
+                                              source=?, created_at=?, updated_at=?,
+                                              location_text=?, location_source=?, location_observed_at=?,
+                                              location_lat=?, location_lon=?, location_accuracy_m=? WHERE id=?""",
+                        (status, default_fx_rate, market_note,
+                         flags_text if flags is not None else row["data_quality_flags"],
+                         source or row["source"],
+                         (row["created_at"] if keep_created_at else created_at) or created_at,
+                         updated_at,
+                         location_text, location_source, location_observed_at,
+                         location_lat, location_lon, location_accuracy_m,
+                         snapshot_id),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE snapshot SET status=?, default_fx_rate=?, market_note=?, data_quality_flags=?,
+                                              source=?, created_at=?, updated_at=? WHERE id=?""",
+                        (status, default_fx_rate, market_note,
+                         flags_text if flags is not None else row["data_quality_flags"],
+                         source or row["source"],
+                         (row["created_at"] if keep_created_at else created_at) or created_at,
+                         updated_at, snapshot_id),
+                    )
                 conn.execute("DELETE FROM snapshot_item WHERE snapshot_id = ?", (snapshot_id,))
             for item in items:
                 conn.execute(
@@ -583,6 +649,56 @@ class Store:
 
     def list_reconcile(self) -> list[sqlite3.Row]:
         return self._all("SELECT * FROM reconcile_period ORDER BY period_date")
+
+    # ------------------------------------------------------------ 地点与逆地理缓存
+    def get_geocode(self, provider: str, lat_key: str, lon_key: str) -> sqlite3.Row | None:
+        return self._one(
+            "SELECT * FROM geocode_cache WHERE provider=? AND lat_key=? AND lon_key=?",
+            (provider, lat_key, lon_key),
+        )
+
+    def upsert_geocode(self, provider: str, lat_key: str, lon_key: str,
+                       text: str | None, fetched_at: str, raw: str | None) -> None:
+        self._run(
+            "INSERT INTO geocode_cache(provider, lat_key, lon_key, text, fetched_at, raw) "
+            "VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(provider, lat_key, lon_key) DO UPDATE SET text=excluded.text, "
+            "fetched_at=excluded.fetched_at, raw=excluded.raw",
+            (provider, lat_key, lon_key, text, fetched_at, raw),
+        )
+
+    # ------------------------------------------------------------ 地点回填辅助
+    def snapshots_with_location(self) -> list[sqlite3.Row]:
+        return self._all("SELECT * FROM snapshot ORDER BY snapshot_date")
+
+    def set_snapshot_location(self, date_text: str, text: str, source: str,
+                              observed_at: str | None, lat: float | None,
+                              lon: float | None, accuracy_m: float | None) -> int:
+        """只填空缺（location_text IS NULL）的期，返回受影响行数。"""
+        cur = self._run(
+            "UPDATE snapshot SET location_text=?, location_source=?, location_observed_at=?, "
+            "location_lat=?, location_lon=?, location_accuracy_m=? "
+            "WHERE snapshot_date=? AND location_text IS NULL",
+            (text, source, observed_at, lat, lon, accuracy_m, date_text),
+        )
+        return cur.rowcount or 0
+
+    def update_snapshot_location(self, date_text: str, *, text: str | None, source: str | None,
+                                 observed_at: str | None, lat: float | None,
+                                 lon: float | None, accuracy_m: float | None) -> int:
+        """显式覆盖某一期的地点（与 set_snapshot_location 的区别：不做 IS NULL 限制）。
+
+        为什么需要两个方法：回填 CLI 的纪律是「只补空缺、已填值不动」（set_snapshot_location）；
+        而用户/工具主动改地点时必须能覆盖旧值，且在 text=None 时把六列一起清回「未观测」——
+        两件事语义相反，混用一个方法会让其中一侧悄悄越权。
+        """
+        cur = self._run(
+            "UPDATE snapshot SET location_text=?, location_source=?, location_observed_at=?, "
+            "location_lat=?, location_lon=?, location_accuracy_m=? "
+            "WHERE snapshot_date=?",
+            (text, source, observed_at, lat, lon, accuracy_m, date_text),
+        )
+        return cur.rowcount or 0
 
 
 def _json_join(flags: Any) -> str | None:

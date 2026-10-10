@@ -27,6 +27,108 @@ from .store import ConflictError, Store
 
 MONEY_EPS = 0.005  # 金额比较容差（分）
 
+# 地点相关常量
+LOCATION_VALID_SOURCES = {"manual", "carried", "device", "parsed_note"}
+LOCATION_API_ALLOWED = {"manual", "carried", "device"}  # parsed_note 只允许 CLI
+LOCATION_ABSENT_REASON = "not_recorded"
+
+
+def _location_from_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any] | None:
+    """从 snapshot 行提取 location 对象；无记录时返回 None。"""
+    # 兼容 Row 与 dict
+    try:
+        text = row["location_text"]  # type: ignore[index]
+    except (KeyError, TypeError, IndexError):
+        return None
+    if text is None or not str(text).strip():
+        return None
+    def _get(key: str) -> Any:
+        try:
+            return row[key]  # type: ignore[index]
+        except Exception:
+            return None
+    return {
+        "text": str(text).strip(),
+        "source": str(_get("location_source") or "manual"),
+        "observed_at": _get("location_observed_at"),
+        "lat": _get("location_lat"),
+        "lon": _get("location_lon"),
+        "accuracy_m": _get("location_accuracy_m"),
+    }
+
+
+def _validate_location(payload: Any, *, allow_parsed_note: bool = False) -> dict[str, Any] | None:
+    """校验并规范化 location payload。
+
+    返回规范化后的 dict（text/source/observed_at/lat/lon/accuracy_m），
+    若 payload 为 None 则返回 None（表示未提供）。
+    非法时抛 DomainError(400)。
+    """
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise DomainError(400, "bad_location", "location 必须是对象")
+    source = str(payload.get("source") or "").strip()
+    if not source:
+        raise DomainError(400, "bad_location", "location.source 不能为空")
+    allowed = LOCATION_VALID_SOURCES if allow_parsed_note else LOCATION_API_ALLOWED
+    if source not in allowed:
+        # 为了让测试能匹配明确错误码，对 parsed_note 单独提示
+        if source == "parsed_note" and not allow_parsed_note:
+            raise DomainError(400, "bad_location", "location.source=parsed_note 只允许 CLI 写入")
+        raise DomainError(400, "bad_location", f"location.source 非法：{source}（允许 {', '.join(sorted(allowed))}）")
+    text = payload.get("text")
+    if text is None or not str(text).strip():
+        raise DomainError(400, "bad_location", "location.text 不能为空")
+    text = str(text).strip()
+    observed_at = payload.get("observed_at")
+    if observed_at is not None:
+        observed_at = str(observed_at).strip()
+        if not observed_at:
+            observed_at = None
+        else:
+            # 宽松校验 ISO8601
+            try:
+                # 允许带 Z 或时区
+                if observed_at.endswith("Z"):
+                    datetime.strptime(observed_at, "%Y-%m-%dT%H:%M:%SZ")
+                else:
+                    datetime.fromisoformat(observed_at)
+            except ValueError as exc:
+                raise DomainError(400, "bad_location", f"location.observed_at 非法：{observed_at}") from exc
+    else:
+        observed_at = None
+    lat = payload.get("lat")
+    lon = payload.get("lon")
+    accuracy_m = payload.get("accuracy_m")
+    # 规范化数值
+    def _num(v: Any, name: str) -> float | None:
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError) as exc:
+            raise DomainError(400, "bad_location", f"location.{name} 非法") from exc
+    lat_f = _num(lat, "lat")
+    lon_f = _num(lon, "lon")
+    acc_f = _num(accuracy_m, "accuracy_m")
+    if lat_f is not None and not (-90 <= lat_f <= 90):
+        raise DomainError(400, "bad_location", "location.lat 必须在 [-90,90] 范围内")
+    if lon_f is not None and not (-180 <= lon_f <= 180):
+        raise DomainError(400, "bad_location", "location.lon 必须在 [-180,180] 范围内")
+    if acc_f is not None and acc_f < 0:
+        raise DomainError(400, "bad_location", "location.accuracy_m 不能为负")
+    if source == "device" and (lat_f is None or lon_f is None):
+        raise DomainError(400, "bad_location", "location.source=device 时必须同时提供 lat/lon")
+    return {
+        "text": text,
+        "source": source,
+        "observed_at": observed_at,
+        "lat": lat_f,
+        "lon": lon_f,
+        "accuracy_m": acc_f,
+    }
+
 
 class DomainError(Exception):
     """业务错误：带 HTTP 状态码与错误码。"""
@@ -414,9 +516,11 @@ def snapshot_list(store: Store) -> list[dict[str, Any]]:
         if title:
             summary[date_text] = title[:48]
 
+    # 预加载 snapshot 行以获取 location
+    snap_map = {r["snapshot_date"]: r for r in store.list_snapshots()}
     out = []
     for row in store.snapshot_totals():
-        out.append({
+        entry: dict[str, Any] = {
             "date": row["date"],
             "status": row["status"] or "final",
             "networth": r2(row["networth"]),
@@ -427,7 +531,17 @@ def snapshot_list(store: Store) -> list[dict[str, Any]]:
             "note_summary": summary.get(row["date"]),
             "data_quality_flags": _flags_of(row["flags"]),
             "source": row["source"],
-        })
+        }
+        snap_row = snap_map.get(row["date"])
+        if snap_row is not None:
+            loc = _location_from_row(snap_row)
+            if loc is not None:
+                entry["location"] = loc
+            else:
+                entry["location_absent_reason"] = LOCATION_ABSENT_REASON
+        else:
+            entry["location_absent_reason"] = LOCATION_ABSENT_REASON
+        out.append(entry)
     return out
 
 
@@ -468,6 +582,11 @@ def snapshot_detail(store: Store, date_text: str) -> dict[str, Any]:
         "total_liabilities": r2(totals.get("total_liabilities")),
         "item_count": int(totals.get("item_count") or 0),
     }
+    loc = _location_from_row(snap)
+    if loc is not None:
+        snapshot["location"] = loc
+    else:
+        snapshot["location_absent_reason"] = LOCATION_ABSENT_REASON
     return {"snapshot": snapshot, "items": items}
 
 
@@ -476,7 +595,7 @@ def carry_forward(store: Store, from_date: str | None = None) -> dict[str, Any]:
     snaps = store.snapshot_totals()
     if not snaps:
         return {"date_default": date_cls.today().isoformat(), "fx_rate_default": None,
-                "source_date": None, "items": []}
+                "source_date": None, "items": [], "location_absent_reason": LOCATION_ABSENT_REASON}
     if from_date:
         date_text = normalize_date(from_date)
         source = next((s for s in snaps if s["date"] == date_text), None)
@@ -513,11 +632,40 @@ def carry_forward(store: Store, from_date: str | None = None) -> dict[str, Any]:
     if fx_default is None:
         rates = [i["fx_rate"] for i in items if i["fx_rate"] is not None]
         fx_default = rates[-1] if rates else None
-    return {
+    result: dict[str, Any] = {
         "date_default": suggested.isoformat(),
         "fx_rate_default": r6(fx_default),
         "source_date": date_text,
         "items": items,
+    }
+    # 地点自动带入：取严格早于目标期的最近一期有地点
+    target_date = suggested.isoformat()
+    loc_default = _find_location_before(store, target_date)
+    if loc_default is not None:
+        result["location_default"] = loc_default
+    else:
+        result["location_absent_reason"] = LOCATION_ABSENT_REASON
+    return result
+
+
+def _find_location_before(store: Store, target_date: str) -> dict[str, Any] | None:
+    """查找严格早于 target_date 的最近一期有地点的期，返回 location_default。"""
+    snaps = store.list_snapshots()
+    # 倒序查找
+    candidate = None
+    for row in reversed(snaps):
+        if str(row["snapshot_date"]) >= target_date:
+            continue
+        loc = _location_from_row(row)
+        if loc is not None:
+            candidate = row
+            break
+    if candidate is None:
+        return None
+    return {
+        "text": str(candidate["location_text"]).strip(),
+        "source": "carried",
+        "from_date": str(candidate["snapshot_date"]),
     }
 
 
@@ -531,6 +679,31 @@ def _opt_float(value: Any, idx: int, field: str) -> float | None:
         raise DomainError(400, "bad_request", f"items[{idx}].{field} 非法") from exc
 
 
+def set_snapshot_location(store: Store, date_text: str, location: Any) -> dict[str, Any]:
+    """PUT/POST /api/snapshots/{date}/location：只改某一期的地点，绝不触碰明细。
+
+    为什么要有这条窄接口：save_snapshot 是整期全量 upsert（事务内 delete+insert items），
+    任何只带 location 的请求都会清空该期明细。地点是 snapshot 上与明细正交的单个字段，
+    给它一条窄写入口，比要求每个调用方（前端、MCP、脚本）都带齐 items 更安全；
+    location=None 表示显式清空，六列一起置 NULL 回到「未观测」，不留半截地点。
+    """
+    date_text = normalize_date(date_text)
+    if store.get_snapshot(date_text) is None:
+        raise DomainError(404, "not_found", f"快照不存在：{date_text}")
+    if location is None:
+        store.update_snapshot_location(date_text, text=None, source=None, observed_at=None,
+                                       lat=None, lon=None, accuracy_m=None)
+    else:
+        loc = _validate_location(location, allow_parsed_note=False)
+        if loc is None:
+            raise DomainError(400, "bad_location", "缺少 location")
+        store.update_snapshot_location(date_text, text=loc["text"], source=loc["source"],
+                                       observed_at=loc["observed_at"], lat=loc["lat"],
+                                       lon=loc["lon"], accuracy_m=loc["accuracy_m"])
+    # 回读权威状态返回：调用方不需要自己再解析一次，也就没有「写入成功但回读口径不一致」的空间。
+    return snapshot_detail(store, date_text)
+
+
 def save_snapshot(store: Store, payload: dict[str, Any], date_from_path: str | None = None) -> dict[str, Any]:
     """POST /api/snapshots 与 PUT /api/snapshots/{date} 共用的 upsert。"""
     date_raw = payload.get("date") or date_from_path
@@ -540,6 +713,14 @@ def save_snapshot(store: Store, payload: dict[str, Any], date_from_path: str | N
     if date_from_path and normalize_date(date_from_path) != date_text:
         raise DomainError(400, "bad_request", "路径 date 与请求体 date 不一致")
 
+    # 防「静默清空」（本片修复）：整期 upsert 是 delete+insert items 的全量写。调用方只想改
+    # 一个与明细正交的字段（例如地点）却漏带 items 键时，旧实现把它当空数组，等于把该期明细
+    # 整片删掉、还不留任何证据——MCP 的 set_location 曾退化成正是这种请求，且写后读验证还会
+    # 因为「读回了地点」而报成功。因此：更新已存在的期必须显式带 items；只想改地点请走专用
+    # 窄接口 PUT/POST /api/snapshots/{date}/location（domain.set_snapshot_location）。
+    if "items" not in payload and store.get_snapshot(date_text) is not None:
+        raise DomainError(400, "partial_update_unsupported",
+                          "更新已存在的期必须带 items（只改地点请用 /api/snapshots/{date}/location）")
     raw_items = payload.get("items")
     if raw_items is None:
         raw_items = []
@@ -602,14 +783,52 @@ def save_snapshot(store: Store, payload: dict[str, Any], date_from_path: str | N
     if fx is None:
         rates = [i["fx_rate"] for i in items if i["fx_rate"] is not None]
         fx = rates[-1] if rates else None
+    # 地点校验
+    _loc_provided = "location" in payload
+    loc_validated: dict[str, Any] | None = None
+    if _loc_provided:
+        loc_raw = payload.get("location")
+        if loc_raw is None:
+            # 显式传 null 视为清空（少见，但保留语义）
+            loc_validated = None
+        else:
+            loc_validated = _validate_location(loc_raw, allow_parsed_note=False)
     ts = now_iso()
-    _sid, created = store.upsert_snapshot(
-        date_text, items, status=status, default_fx_rate=fx,
-        market_note=payload.get("market_note"),
-        flags=payload.get("data_quality_flags") if payload.get("data_quality_flags") is not None else None,
-        source=str(payload.get("source") or "manual"),
-        created_at=ts, updated_at=ts,
-    )
+    if _loc_provided:
+        if loc_validated is None:
+            _sid, created = store.upsert_snapshot(
+                date_text, items, status=status, default_fx_rate=fx,
+                market_note=payload.get("market_note"),
+                flags=payload.get("data_quality_flags") if payload.get("data_quality_flags") is not None else None,
+                source=str(payload.get("source") or "manual"),
+                created_at=ts, updated_at=ts,
+                location_text=None, location_source=None, location_observed_at=None,
+                location_lat=None, location_lon=None, location_accuracy_m=None,
+                _location_provided=True,
+            )
+        else:
+            _sid, created = store.upsert_snapshot(
+                date_text, items, status=status, default_fx_rate=fx,
+                market_note=payload.get("market_note"),
+                flags=payload.get("data_quality_flags") if payload.get("data_quality_flags") is not None else None,
+                source=str(payload.get("source") or "manual"),
+                created_at=ts, updated_at=ts,
+                location_text=loc_validated["text"],
+                location_source=loc_validated["source"],
+                location_observed_at=loc_validated["observed_at"],
+                location_lat=loc_validated["lat"],
+                location_lon=loc_validated["lon"],
+                location_accuracy_m=loc_validated["accuracy_m"],
+                _location_provided=True,
+            )
+    else:
+        _sid, created = store.upsert_snapshot(
+            date_text, items, status=status, default_fx_rate=fx,
+            market_note=payload.get("market_note"),
+            flags=payload.get("data_quality_flags") if payload.get("data_quality_flags") is not None else None,
+            source=str(payload.get("source") or "manual"),
+            created_at=ts, updated_at=ts,
+        )
     detail = snapshot_detail(store, date_text)
     detail["created"] = created
     return detail
@@ -856,6 +1075,100 @@ def reconcile_metrics(store: Store, settings: Settings) -> dict[str, Any]:
     return {"periods": periods, "source": str(path)}
 
 
+def location_reverse(store: Store, lat: Any, lon: Any, *, refresh: bool = False,
+                     fetcher: Any | None = None) -> dict[str, Any]:
+    """GET /api/location/reverse：逆地理编码，带缓存与 provider 分发。"""
+    # 校验坐标
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except (TypeError, ValueError) as exc:
+        raise DomainError(400, "bad_location", "lat/lon 必须是数字") from exc
+    if not (-90 <= lat_f <= 90):
+        raise DomainError(400, "bad_location", "lat 必须在 [-90,90] 范围内")
+    if not (-180 <= lon_f <= 180):
+        raise DomainError(400, "bad_location", "lon 必须在 [-180,180] 范围内")
+    # 动态导入 geocode，避免循环依赖
+    from . import geocode as _geocode
+    try:
+        result = _geocode.resolve(store, lat_f, lon_f, refresh=refresh, fetcher=fetcher)
+    except _geocode.GeocodeUnavailable as exc:
+        msg = str(exc)
+        if msg == "provider_disabled":
+            raise DomainError(409, "provider_disabled", "逆地理编码未启用（NETWORTH_GEOCODE_PROVIDER=off）") from exc
+        if msg == "provider_not_configured":
+            raise DomainError(409, "provider_not_configured", "高德服务未配置 NETWORTH_AMAP_KEY") from exc
+        raise DomainError(502, "geocode_failed", f"逆地理编码失败：{exc}") from exc
+    return result
+
+
+def location_metrics(store: Store) -> dict[str, Any]:
+    """GET /api/metrics/locations：按地点聚合停留区间与净值变化。"""
+    totals = {row["date"]: row for row in store.snapshot_totals()}
+    snaps = store.list_snapshots()
+    # 按 text 分组
+    groups_map: dict[str, list[dict[str, Any]]] = {}
+    unrecorded = 0
+    for row in snaps:
+        loc = _location_from_row(row)
+        date_text = str(row["snapshot_date"])
+        if loc is None:
+            unrecorded += 1
+            continue
+        text = loc["text"]
+        groups_map.setdefault(text, []).append({
+            "date": date_text,
+            "networth": r2(totals.get(date_text, {}).get("networth")),
+        })
+    groups: list[dict[str, Any]] = []
+    for text in sorted(groups_map.keys(), key=lambda t: groups_map[t][0]["date"] if groups_map[t] else ""):
+        entries = sorted(groups_map[text], key=lambda e: e["date"])
+        periods = len(entries)
+        first_date = entries[0]["date"]
+        last_date = entries[-1]["date"]
+        first_nw = entries[0]["networth"]
+        last_nw = entries[-1]["networth"]
+        networth_change = None
+        if first_nw is not None and last_nw is not None:
+            networth_change = r2(last_nw - first_nw)
+        # 计算 stays：遍历全部快照，按日期顺序，相同 text 连续的区间
+        stays: list[dict[str, Any]] = []
+        # 需要按全体 snaps 的日期顺序扫描
+        cur_start: str | None = None
+        cur_end: str | None = None
+        cur_count = 0
+        for row in snaps:
+            loc = _location_from_row(row)
+            cur_text = loc["text"] if loc else None
+            if cur_text == text:
+                if cur_start is None:
+                    cur_start = str(row["snapshot_date"])
+                    cur_end = cur_start
+                    cur_count = 1
+                else:
+                    cur_end = str(row["snapshot_date"])
+                    cur_count += 1
+            else:
+                if cur_start is not None:
+                    stays.append({"from": cur_start, "to": cur_end, "periods": cur_count})
+                    cur_start = None
+                    cur_end = None
+                    cur_count = 0
+        if cur_start is not None:
+            stays.append({"from": cur_start, "to": cur_end, "periods": cur_count})
+        groups.append({
+            "text": text,
+            "periods": periods,
+            "first_date": first_date,
+            "last_date": last_date,
+            "networth_change": networth_change,
+            "stays": stays,
+        })
+    # 按 first_date 排序
+    groups.sort(key=lambda g: g["first_date"])
+    return {"groups": groups, "unrecorded_periods": unrecorded}
+
+
 # ---------------------------------------------------------------- 导入导出
 
 def export_payload(store: Store) -> dict[str, Any]:
@@ -905,6 +1218,7 @@ def export_payload(store: Store) -> dict[str, Any]:
             "source": row["source"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "location": _location_from_row(row),
             "items": items,
         })
     events = [{
@@ -989,16 +1303,45 @@ def import_payload(store: Store, payload: dict[str, Any]) -> dict[str, Any]:
                 "flags": _json_text(flags),
             })
         ts = now_iso()
-        store.upsert_snapshot(
-            date_text, items,
-            status=str(snap.get("status") or "final"),
-            default_fx_rate=snap.get("default_fx_rate"),
-            market_note=snap.get("market_note"),
-            flags=snap.get("data_quality_flags") or [],
-            source=str(snap.get("source") or "manual"),
-            created_at=snap.get("created_at") or ts,
-            updated_at=ts,
-        )
+        loc = snap.get("location")
+        loc_validated = None
+        loc_provided = False
+        if loc is not None:
+            if isinstance(loc, dict):
+                loc_validated = _validate_location(loc, allow_parsed_note=True)
+                loc_provided = True
+            elif loc is None:
+                loc_provided = False
+        # 若快照包含 location 字段（即使为 dict），则透传
+        if loc_provided and loc_validated is not None:
+            store.upsert_snapshot(
+                date_text, items,
+                status=str(snap.get("status") or "final"),
+                default_fx_rate=snap.get("default_fx_rate"),
+                market_note=snap.get("market_note"),
+                flags=snap.get("data_quality_flags") or [],
+                source=str(snap.get("source") or "manual"),
+                created_at=snap.get("created_at") or ts,
+                updated_at=ts,
+                location_text=loc_validated["text"],
+                location_source=loc_validated["source"],
+                location_observed_at=loc_validated["observed_at"],
+                location_lat=loc_validated["lat"],
+                location_lon=loc_validated["lon"],
+                location_accuracy_m=loc_validated["accuracy_m"],
+                _location_provided=True,
+            )
+        else:
+            store.upsert_snapshot(
+                date_text, items,
+                status=str(snap.get("status") or "final"),
+                default_fx_rate=snap.get("default_fx_rate"),
+                market_note=snap.get("market_note"),
+                flags=snap.get("data_quality_flags") or [],
+                source=str(snap.get("source") or "manual"),
+                created_at=snap.get("created_at") or ts,
+                updated_at=ts,
+            )
         item_count += len(items)
 
     # 3) 事件

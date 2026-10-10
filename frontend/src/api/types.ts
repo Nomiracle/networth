@@ -93,6 +93,28 @@ export interface SnapshotSummary {
   /** 该期明细行备注的摘要（最多 2 条），期级备注为空时用它 */
   note_summary?: string | null
   data_quality_flags?: string | null
+  /** 地点：未观测时键缺失，用 location_absent_reason 说明原因 */
+  location?: SnapshotLocation | null
+  location_absent_reason?: string | null
+}
+
+/** 地点对象：严格按后端契约，未观测时键缺失 */
+export type LocationSource = 'manual' | 'carried' | 'device' | 'parsed_note'
+
+export interface SnapshotLocation {
+  text: string
+  source: LocationSource
+  observed_at: string | null
+  lat: number | null
+  lon: number | null
+  accuracy_m: number | null
+}
+
+/** carry-forward 带回的默认地点 */
+export interface LocationDefault {
+  text: string
+  source: 'carried'
+  from_date: string
 }
 
 export interface SnapshotItem {
@@ -117,6 +139,9 @@ export interface SnapshotDetail {
     data_quality_flags?: string | null
     created_at?: string | null
     updated_at?: string | null
+    /** 地点：未观测时键缺失 */
+    location?: SnapshotLocation | null
+    location_absent_reason?: string | null
   }
   items: SnapshotItem[]
 }
@@ -125,6 +150,8 @@ export interface CarryForwardResult {
   date_default: string
   fx_rate_default: number
   items: SnapshotItem[]
+  /** 可选：沿用最近一期地点 */
+  location_default?: LocationDefault | null
 }
 
 export interface FxResult {
@@ -154,6 +181,8 @@ export interface SaveSnapshotPayload {
   market_note: string
   items: SaveItemPayload[]
   status?: 'draft' | 'final'
+  /** 地点：未观测时不传该键 */
+  location?: SnapshotLocation | null
 }
 
 export interface StructureGroup {
@@ -166,6 +195,19 @@ export interface StructureResult {
   date: string
   groups: StructureGroup[]
   liabilities: StructureGroup[]
+}
+
+/** 逆地理编码结果 */
+export interface LocationReverseResult {
+  text: string
+  provider: string
+  cached: boolean
+}
+
+/** 地点分布统计 */
+export interface LocationMetrics {
+  groups: Array<{ text: string; count: number; share?: number }>
+  unrecorded_periods: number
 }
 
 /** 投资日志条目（由明细行备注聚合去重而来） */

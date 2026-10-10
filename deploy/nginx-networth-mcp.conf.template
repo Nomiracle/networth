@@ -1,0 +1,55 @@
+# networth-mcp 反代模板（本地 127.0.0.1:18084，仅回环监听）
+# 域名占位：__DOMAIN__  -> 真实域名由 deploy/render.sh 或手工替换
+# 安装位置：<NGINX_CONF_DIR>/__DOMAIN__.conf
+# 生效：docker exec nginx nginx -t && docker exec nginx nginx -s reload
+
+upstream networth_mcp_backend {
+    server 127.0.0.1:18084;
+    keepalive 32;
+}
+
+server {
+    listen 81;
+    server_name __DOMAIN__;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name __DOMAIN__;
+
+    ssl_certificate /etc/ssl/cloudflare/cert.pem;
+    ssl_certificate_key /etc/ssl/cloudflare/key.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    access_log /var/log/nginx/networth-mcp-access.log;
+    error_log  /var/log/nginx/networth-mcp-error.log;
+
+    # MCP 端点仅本地回环，公网经 nginx + Basic auth 暴露
+    location /mcp {
+        auth_basic "networth-mcp";
+        auth_basic_user_file /etc/nginx/auth/networth-mcp.htpasswd;
+
+        proxy_pass http://networth_mcp_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # 透传 MCP 协议版本头，供服务端协商
+        proxy_set_header mcp-protocol-version $http_mcp_protocol_version;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+
+    location = /healthz {
+        proxy_pass http://networth_mcp_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+    }
+}

@@ -18,6 +18,22 @@ const busy = ref(false)
 const health = ref<HealthzResult | null>(null)
 const healthErr = ref('')
 const exportInfo = ref<{ accounts: number; snapshots: number; events: number; at: string } | null>(null)
+const geoProbe = ref('')
+async function probeGeo(): Promise<void> {
+  geoProbe.value = '探测中…'
+  try {
+    const { fetchLocationReverse } = await import('@/api/endpoints')
+    // 用合成坐标探测，仅为探活，不展示真实位置
+    const r = await fetchLocationReverse(39.9, 116.4)
+    geoProbe.value = `可用（provider=${r.provider} cached=${r.cached} 示例：${r.text}）`
+  } catch (e) {
+    const { isApiError, errorText: et } = await import('@/api/client')
+    if (isApiError(e) && (e as unknown as { status: number }).status === 409) geoProbe.value = '未配置（409 provider_disabled）'
+    else if (isApiError(e) && (e as unknown as { status: number }).status === 502) geoProbe.value = `失败（502 geocode_failed）：${et(e)}`
+    else geoProbe.value = et(e)
+  }
+}
+
 const regState = ref<{ kind: 'closed' | 'open' | 'unknown' | 'probing'; text: string; raw: string }>({
   kind: 'probing',
   text: '正在探测…',
@@ -186,6 +202,25 @@ async function onLogout(): Promise<void> {
       <div class="hint-line" style="margin-top: 8px">
         注册由服务端环境变量 <span class="mono">ALLOW_REGISTRATION</span> 控制；契约未提供查询接口，此处以一次故意非法的注册请求
         （空密码）探测：403 = 已关闭，400 = 服务端先校验参数、无法判定，2xx = 已开启。该探测不会创建账号。
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">逆地理编码（地点）服务</h2>
+      <div class="hint-line" style="margin-bottom: 8px">只读展示：前端不设置环境变量，服务端通过环境变量配置。</div>
+      <div class="kv">
+        <span class="k">环境变量</span><span class="v mono">NETWORTH_GEOCODE_PROVIDER</span>
+        <span class="k">取值</span><span class="v"><span class="mono">off</span>（关闭）/ <span class="mono">nominatim</span> / <span class="mono">amap</span></span>
+        <span class="k">amap 额外</span><span class="v mono">NETWORTH_AMAP_KEY</span>
+        <span class="k">前端行为</span><span class="v">provider_disabled(409) → 提示「未配置逆地理编码服务，请在设置页查看开启方式」；geocode_failed(502) → 提示失败并保留手动输入</span>
+        <span class="k">接口</span><span class="v mono">GET /api/location/reverse?lat=&lon=[&refresh=1]</span>
+      </div>
+      <div class="hint-line" style="margin-top: 8px">如需开启，请在后端部署环境中设置上述变量后重启服务；前端仅展示说明，不提供写入入口。</div>
+      <div v-if="geoProbe" class="kv" style="margin-top: 10px">
+        <span class="k">探测结果</span><span class="v">{{ geoProbe }}</span>
+      </div>
+      <div class="row-actions" style="margin-top: 8px">
+        <el-button size="small" @click="probeGeo">探测逆地理编码状态</el-button>
       </div>
     </div>
 

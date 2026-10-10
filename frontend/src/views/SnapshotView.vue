@@ -11,7 +11,7 @@ import {
   fetchSnapshot,
   saveSnapshot,
 } from '@/api/endpoints'
-import type { Account, CarryForwardResult, DiffResult, FxResult, SaveItemPayload, SnapshotDetail } from '@/api/types'
+import type { Account, CarryForwardResult, DiffResult, FxResult, SaveItemPayload, SaveSnapshotPayload, SnapshotDetail } from '@/api/types'
 import { errorText, isApiError } from '@/api/client'
 import { useSettingsStore } from '@/stores/settings'
 import { fmtCompact, fmtMoney, fmtPct, fmtSigned, todayISO, trendClass } from '@/utils/format'
@@ -59,6 +59,18 @@ const formDate = ref(todayISO())
 const fxRate = ref(settings.defaultFxRate)
 const marketNote = ref('')
 const status = ref<'draft' | 'final'>('final')
+// 地点：与 marketNote 同级的一等字段
+const locationText = ref('')
+const locationSource = ref<'' | 'manual' | 'carried' | 'device' | 'parsed_note'>('')
+const locationObservedAt = ref<string | null>(null)
+const locationLat = ref<number | null>(null)
+const locationLon = ref<number | null>(null)
+const locationAccuracy = ref<number | null>(null)
+const locationAbsentReason = ref('')
+const locationTouched = ref(false) // 用户手动改过，自动带入不得覆盖
+const locationLoading = ref(false)
+const locationError = ref('')
+const locationDefault = ref<{ text: string; from_date: string } | null>(null)
 /** 进入页面时的状态指纹，用于未保存改动检测 */
 const savedFingerprint = ref('')
 const mode = ref<'new' | 'edit'>('new')
@@ -212,7 +224,8 @@ function fingerprint(): string {
     .filter((r) => !r.removed)
     .map((r) => `${r.account_id}:${r.ccy}:${r.amount}:${r.usd}:${r.note}`)
     .join('|')
-  return `${formDate.value}|${fxRate.value}|${marketNote.value}|${status.value}|${body}`
+  const loc = `${locationText.value}|${locationSource.value}|${locationLat.value}|${locationLon.value}`
+  return `${formDate.value}|${fxRate.value}|${marketNote.value}|${loc}|${status.value}|${body}`
 }
 
 const dirty = computed(() => fingerprint() !== savedFingerprint.value)
@@ -311,6 +324,27 @@ function applyCarry(cf: CarryForwardResult, date: string): void {
   formDate.value = date
   fxRate.value = typeof cf.fx_rate_default === 'number' && cf.fx_rate_default > 0 ? cf.fx_rate_default : settings.defaultFxRate
   marketNote.value = ''
+  // 地点：沿用最近一期地点，但不得覆盖用户已手动改过的值
+  if (cf.location_default && typeof cf.location_default.text === 'string' && cf.location_default.text.trim()) {
+    locationDefault.value = { text: cf.location_default.text.trim(), from_date: cf.location_default.from_date }
+    if (!locationTouched.value && !locationText.value.trim()) {
+      locationText.value = cf.location_default.text.trim()
+      locationSource.value = 'carried'
+      locationObservedAt.value = null
+      locationLat.value = null
+      locationLon.value = null
+      locationAccuracy.value = null
+      locationAbsentReason.value = ''
+      locationError.value = ''
+    }
+  } else {
+    locationDefault.value = null
+    // 保留已手动填写的值；若未填写则标记为未记录
+    if (!locationTouched.value && !locationText.value.trim()) {
+      locationSource.value = ''
+      locationAbsentReason.value = '该期未记录地点'
+    }
+  }
   status.value = 'final'
   mode.value = 'new'
   collapaseAll(false)
@@ -321,6 +355,30 @@ function applyDetail(d: SnapshotDetail): void {
   formDate.value = d.snapshot.date
   fxRate.value = typeof d.snapshot.default_fx_rate === 'number' && d.snapshot.default_fx_rate > 0 ? d.snapshot.default_fx_rate : settings.defaultFxRate
   marketNote.value = d.snapshot.market_note ?? ''
+  // 地点：已有则回填，不得用自动带入覆盖
+  const loc = d.snapshot.location as unknown as { text?: string; source?: string; observed_at?: string | null; lat?: number | null; lon?: number | null; accuracy_m?: number | null } | null | undefined
+  if (loc && typeof loc.text === 'string' && loc.text.trim()) {
+    locationText.value = loc.text.trim()
+    locationSource.value = (loc.source as typeof locationSource.value) || 'manual'
+    locationObservedAt.value = loc.observed_at ?? null
+    locationLat.value = typeof loc.lat === 'number' ? loc.lat : null
+    locationLon.value = typeof loc.lon === 'number' ? loc.lon : null
+    locationAccuracy.value = typeof loc.accuracy_m === 'number' ? loc.accuracy_m : null
+    locationAbsentReason.value = ''
+    locationTouched.value = false
+    locationDefault.value = null
+  } else {
+    locationText.value = ''
+    locationSource.value = ''
+    locationLat.value = null
+    locationLon.value = null
+    locationAccuracy.value = null
+    locationObservedAt.value = null
+    locationAbsentReason.value = (d.snapshot.location_absent_reason as string) || '未记录'
+    locationDefault.value = null
+    // 保留 touched=false，让新期 carry-forward 能自动带入
+    locationTouched.value = false
+  }
   status.value = d.snapshot.status === 'draft' ? 'draft' : 'final'
   mode.value = 'edit'
   collapaseAll(false)
@@ -354,6 +412,101 @@ async function loadFx(date: string, refresh = false): Promise<void> {
     fxError.value = `${errorText(e)}（可手动填写）`
   } finally {
     fxLoading.value = false
+  }
+}
+
+/* --------------------------- 地点 --------------------------- */
+const locationSourceLabel = computed(() => {
+  const m: Record<string, string> = { manual: '手动', carried: '沿用', device: '定位', parsed_note: '备注解析' }
+  return locationSource.value ? (m[locationSource.value] ?? locationSource.value) : ''
+})
+
+function onLocationInput(v: string): void {
+  locationText.value = v
+  locationTouched.value = true
+  locationError.value = ''
+  if (v.trim()) {
+    locationSource.value = 'manual'
+    locationAbsentReason.value = ''
+  } else {
+    locationSource.value = ''
+    locationLat.value = null
+    locationLon.value = null
+    locationAccuracy.value = null
+    locationObservedAt.value = null
+  }
+}
+
+function useCarriedLocation(): void {
+  if (!locationDefault.value) return
+  // 沿用不得覆盖用户手动改过的值——但按钮是显式操作，允许覆盖
+  locationText.value = locationDefault.value.text
+  locationSource.value = 'carried'
+  locationObservedAt.value = null
+  locationLat.value = null
+  locationLon.value = null
+  locationAccuracy.value = null
+  locationAbsentReason.value = ''
+  locationError.value = ''
+  locationTouched.value = false
+  ElMessage.success(`已沿用上一期地点：${locationDefault.value.text}（${locationDefault.value.from_date}）`)
+}
+
+async function useDeviceLocation(): Promise<void> {
+  locationError.value = ''
+  if (!('geolocation' in navigator)) {
+    locationError.value = '当前浏览器不支持定位，请手动填写'
+    ElMessage.error(locationError.value)
+    return
+  }
+  locationLoading.value = true
+  let pos: GeolocationPosition
+  try {
+    pos = await new Promise<GeolocationPosition>((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 })
+    })
+  } catch (e: unknown) {
+    const err = e as GeolocationPositionError
+    if (err && typeof err.code === 'number') {
+      if (err.code === 1) locationError.value = '定位权限被拒绝，请手动填写或在浏览器设置中允许定位'
+      else if (err.code === 2) locationError.value = '无法获取位置，请手动填写'
+      else if (err.code === 3) locationError.value = '定位超时，请手动填写或重试'
+      else locationError.value = '无法获取位置，请手动填写'
+    } else {
+      locationError.value = '无法获取位置，请手动填写'
+    }
+    ElMessage.error(locationError.value)
+    locationLoading.value = false
+    return
+  }
+  const lat = pos.coords.latitude
+  const lon = pos.coords.longitude
+  const accuracy = pos.coords.accuracy
+  try {
+    const { fetchLocationReverse } = await import('@/api/endpoints')
+    const res = await fetchLocationReverse(lat, lon)
+    locationText.value = res.text
+    locationSource.value = 'device'
+    locationLat.value = lat
+    locationLon.value = lon
+    locationAccuracy.value = Math.round(accuracy)
+    locationObservedAt.value = new Date().toISOString()
+    locationAbsentReason.value = ''
+    locationTouched.value = true
+    ElMessage.success(`已定位：${res.text}`)
+  } catch (e) {
+    if (isApiError(e) && e.status === 409) {
+      locationError.value = '未配置逆地理编码服务，请在设置页查看开启方式'
+      ElMessage.error(locationError.value)
+    } else if (isApiError(e) && e.status === 502) {
+      locationError.value = `逆地理编码失败：${e.message}，请手动填写`
+      ElMessage.error(locationError.value)
+    } else {
+      locationError.value = `${errorText(e)}，请手动填写`
+      ElMessage.error(locationError.value)
+    }
+  } finally {
+    locationLoading.value = false
   }
 }
 
@@ -569,13 +722,7 @@ const selectableAccounts = computed(() => {
   return accounts.value.filter((a) => !used.has(a.id))
 })
 
-function buildPayload(sv: 'draft' | 'final'): {
-  date: string
-  default_fx_rate: number
-  market_note: string
-  items: SaveItemPayload[]
-  status: 'draft' | 'final'
-} {
+function buildPayload(sv: 'draft' | 'final'): SaveSnapshotPayload {
   const items: SaveItemPayload[] = rows.value
     .filter((r) => !r.removed)
     .map((r) => {
@@ -593,13 +740,28 @@ function buildPayload(sv: 'draft' | 'final'): {
         auto_filled: r.auto_filled && !isChanged(r),
       }
     })
-  return {
+  const trimmedLoc = locationText.value.trim()
+  const payload: SaveSnapshotPayload = {
     date: formDate.value,
     default_fx_rate: Number(fxRate.value),
     market_note: marketNote.value.trim(),
     items,
     status: sv,
   }
+  if (trimmedLoc) {
+    let src = (locationSource.value || 'manual') as 'manual' | 'carried' | 'device' | 'parsed_note'
+    if (src === 'parsed_note') src = 'manual'
+    if (src !== 'manual' && src !== 'carried' && src !== 'device') src = 'manual'
+    payload.location = {
+      text: trimmedLoc,
+      source: src,
+      observed_at: src === 'device' ? (locationObservedAt.value ?? new Date().toISOString()) : null,
+      lat: src === 'device' ? locationLat.value : null,
+      lon: src === 'device' ? locationLon.value : null,
+      accuracy_m: src === 'device' ? locationAccuracy.value : null,
+    }
+  }
+  return payload
 }
 
 async function doSave(sv: 'draft' | 'final'): Promise<void> {
@@ -770,6 +932,33 @@ const hasPrev = computed(() => mode.value === 'edit' || savedFingerprint.value !
           <div class="grow" style="flex: 1 1 100%">
             <div class="field-label">市场备注 / 事件</div>
             <el-input v-model="marketNote" type="textarea" :rows="2" placeholder="例如：入金 30000 元；BTC 大幅回调" />
+          </div>
+          <div class="grow" style="flex: 1 1 100%">
+            <div class="field-label">
+              地点
+              <span v-if="locationSourceLabel" class="tagline blue" style="margin-left: 6px">{{ locationSourceLabel }}</span>
+              <span v-if="locationSource === 'carried' && locationDefault" class="muted" style="margin-left: 4px">（沿用 {{ locationDefault.from_date }}）</span>
+              <span v-if="locationSource === 'parsed_note'" class="tagline warn" style="margin-left: 4px">备注解析</span>
+            </div>
+            <div style="display: flex; gap: 8px; align-items: flex-start">
+              <el-input
+                :model-value="locationText"
+                placeholder="例如：示例城市A · 未记录则显示「未记录」"
+                clearable
+                style="flex: 1"
+                data-testid="snapshot-location"
+                @update:model-value="onLocationInput"
+                @clear="onLocationInput('')"
+              />
+              <el-button size="small" :loading="locationLoading" data-testid="snapshot-location-device" @click="useDeviceLocation">使用当前位置</el-button>
+              <el-button v-if="locationDefault" size="small" data-testid="snapshot-location-carry" @click="useCarriedLocation">沿用上期</el-button>
+            </div>
+            <div class="fx-note" data-testid="snapshot-location-note">
+              <template v-if="locationError"><span class="warn">{{ locationError }}</span></template>
+              <template v-else-if="locationText && locationSourceLabel">来源：{{ locationSourceLabel }}<template v-if="locationSource === 'carried' && locationDefault">（{{ locationDefault.from_date }}）</template><template v-if="locationAccuracy"> · 精度约 {{ locationAccuracy }}m</template></template>
+              <template v-else-if="!locationText">{{ locationAbsentReason || '未记录' }}</template>
+              <template v-else>可手动输入，自动带入不会覆盖已填写的值</template>
+            </div>
           </div>
         </div>
 

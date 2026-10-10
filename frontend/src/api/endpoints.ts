@@ -9,6 +9,8 @@ import type {
   HealthzResult,
   ImportResult,
   JournalResult,
+  LocationMetrics,
+  LocationReverseResult,
   LoginResult,
   MeResult,
   NetworthMetrics,
@@ -142,6 +144,20 @@ export async function fetchJournal(params?: {
       limit: params?.limit,
     },
   })
+  return data
+}
+
+/** 逆地理编码：坐标 → 城市名（用户点击才请求定位） */
+export async function fetchLocationReverse(lat: number, lon: number, refresh = false): Promise<LocationReverseResult> {
+  const { data } = await http.get<LocationReverseResult>('/api/location/reverse', {
+    params: { lat, lon, refresh: refresh ? 1 : undefined },
+  })
+  return data
+}
+
+/** 地点分布统计（只读小卡片，可选） */
+export async function fetchLocationMetrics(): Promise<LocationMetrics> {
+  const { data } = await http.get<LocationMetrics>('/api/metrics/locations')
   return data
 }
 

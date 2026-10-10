@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { fetchDiff, fetchNetworth, fetchSnapshot, fetchSnapshots, fetchStructure } from '@/api/endpoints'
+import { fetchDiff, fetchLocationMetrics, fetchNetworth, fetchSnapshot, fetchSnapshots, fetchStructure } from '@/api/endpoints'
 import type {
   DiffResult,
+  LocationMetrics,
   NetworthKpi,
   NetworthPoint,
   SnapshotDetail,
@@ -32,6 +33,7 @@ const holdings = ref<SnapshotItem[]>([])
 const latestDate = ref('')
 const range = ref<'all' | '1y' | '3y'>('all')
 const showAllRows = ref(false)
+const locationMetrics = ref<LocationMetrics | null>(null)
 
 async function load(): Promise<void> {
   loading.value = true
@@ -61,6 +63,14 @@ async function load(): Promise<void> {
 }
 
 onMounted(load)
+
+onMounted(async () => {
+  try {
+    locationMetrics.value = await fetchLocationMetrics()
+  } catch {
+    /* 忽略，可选卡片 */
+  }
+})
 
 const noteOf = computed<Record<string, string>>(() => {
   const map: Record<string, string> = {}
@@ -116,6 +126,16 @@ const detailFlags = computed<string[]>(() => {
   } catch {
     return [String(raw)]
   }
+})
+
+/** 地点展示（未记录时不显示假值） */
+const detailLocation = computed(() => detail.value?.snapshot?.location ?? null)
+const detailLocationAbsentReason = computed(() => (detail.value?.snapshot as Record<string, unknown>)?.location_absent_reason as string | undefined ?? '')
+const detailLocationLabel = computed(() => {
+  const loc = detailLocation.value
+  if (!loc || !loc.text) return ''
+  const m: Record<string, string> = { manual: '手动', carried: '沿用', device: '定位', parsed_note: '备注解析' }
+  return m[loc.source] ?? loc.source
 })
 
 /** 账户明细：按 大类 → 小类 → 账户名 排序，便于和原始表格对照 */
@@ -619,6 +639,15 @@ function barShare(amount: number, kind: 'asset' | 'liability'): string {
       </div>
     </template>
 
+    <div v-if="locationMetrics" class="card">
+      <h2 class="card-title">地点分布（只读）</h2>
+      <div v-if="locationMetrics.groups && locationMetrics.groups.length" class="hint-line">
+        <span v-for="g in locationMetrics.groups" :key="g.text" style="margin-right: 12px"><b>{{ g.text }}</b> {{ g.count }} 期</span>
+      </div>
+      <div v-else class="hint-line">暂无地点统计</div>
+      <div class="hint-line" style="margin-top: 4px">未记录 {{ locationMetrics.unrecorded_periods }} 期 · 缺失不等于 0</div>
+    </div>
+
     <!-- 期次详情抽屉（只读，点「净值明细」任意一行打开） -->
     <el-drawer
       v-model="detailOpen"
@@ -665,6 +694,16 @@ function barShare(amount: number, kind: 'asset' | 'liability'): string {
 
         <div v-if="detail.snapshot.market_note" class="note-box">
           <b>市场备注：</b>{{ detail.snapshot.market_note }}
+        </div>
+        <div class="note-box" style="margin-top: 8px">
+          <template v-if="detailLocation && detailLocation.text">
+            <b>地点：</b>{{ detailLocation.text }}
+            <el-tag size="small" effect="plain" style="margin-left: 6px">{{ detailLocationLabel }}</el-tag>
+            <span v-if="detailLocation.observed_at" class="jmuted" style="margin-left: 6px">{{ String(detailLocation.observed_at).slice(0, 16).replace('T', ' ') }}</span>
+          </template>
+          <template v-else>
+            <b>地点：</b><span class="muted">未记录</span><span v-if="detailLocationAbsentReason" class="jmuted" style="margin-left: 6px">（{{ detailLocationAbsentReason }}）</span>
+          </template>
         </div>
 
         <!-- 本期投资日志：原表把日志写在明细备注上、同期重复出现在多个账户行 → 这里聚合去重只显示一次 -->
